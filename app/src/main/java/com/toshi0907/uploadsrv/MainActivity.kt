@@ -303,15 +303,22 @@ private fun ServerCard(settings: AppSettings, folderValid: Boolean) {
                             color = MaterialTheme.colorScheme.error,
                         )
                     } else {
-                        SelectionContainer {
-                            Column {
-                                addresses.forEach { ip ->
+                        Text(text = "スマホ等のカメラでQRコードを読み取っても開けます")
+                        addresses.forEach { ip ->
+                            val url = "http://$ip:${s.port}"
+                            Column(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                SelectionContainer {
                                     Text(
-                                        text = "http://$ip:${s.port}",
+                                        text = url,
                                         style = MaterialTheme.typography.titleMedium,
                                         color = MaterialTheme.colorScheme.primary,
                                     )
                                 }
+                                QrCode(text = url)
                             }
                         }
                     }
