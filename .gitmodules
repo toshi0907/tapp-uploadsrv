@@ -1,0 +1,4 @@
+[submodule ".myskills"]
+	path = .myskills
+	url = https://github.com/toshi0907/myskills.git
+	branch = main
