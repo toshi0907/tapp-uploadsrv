@@ -1,15 +1,19 @@
 package com.toshi0907.uploadsrv
 
+import android.util.Log
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.scale
+import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.Dp
@@ -20,7 +24,12 @@ import com.google.zxing.common.BitMatrix
 import com.google.zxing.qrcode.QRCodeWriter
 import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
 
-/** 文字列をQRコードのモジュール行列に変換する。余白(クワイエットゾーン)は含めない。 */
+private const val TAG = "QrCode"
+
+/** 規格上必要な余白(クワイエットゾーン)のモジュール数。 */
+private const val QUIET_ZONE_MODULES = 4
+
+/** 文字列をQRコードのモジュール行列に変換する。余白は含めない。失敗時は null。 */
 private fun encodeQr(text: String): BitMatrix? = runCatching {
     QRCodeWriter().encode(
         text,
@@ -32,34 +41,44 @@ private fun encodeQr(text: String): BitMatrix? = runCatching {
             EncodeHintType.MARGIN to 0,
         ),
     )
-}.getOrNull()
+}.onFailure { Log.w(TAG, "QRコードの生成に失敗しました", it) }.getOrNull()
+
+/** 黒モジュールを1×1単位の矩形として集めたパス。描画時に拡大する。 */
+private fun BitMatrix.toPath(): Path = Path().apply {
+    for (y in 0 until height) {
+        for (x in 0 until width) {
+            if (this@toPath[x, y]) addRect(Rect(x.toFloat(), y.toFloat(), x + 1f, y + 1f))
+        }
+    }
+}
 
 /**
  * [text] のQRコードを表示する。
- * ダークテーマでも読み取れるよう、白地に黒で描画し周囲に余白を付ける。
+ * ダークテーマでも読み取れるよう、白地に黒で描画し4モジュール分の余白を付ける。
  */
 @Composable
-fun QrCode(text: String, modifier: Modifier = Modifier, size: Dp = 200.dp) {
-    val matrix = remember(text) { encodeQr(text) } ?: return
+fun QrCode(text: String, modifier: Modifier = Modifier, size: Dp = 232.dp) {
+    val qr = remember(text) { encodeQr(text)?.let { it.width to it.toPath() } }
+    if (qr == null) {
+        Text(text = "QRコードを生成できませんでした", color = MaterialTheme.colorScheme.error)
+        return
+    }
+    val (modules, path) = qr
     Canvas(
         modifier = modifier
-            .background(Color.White)
-            .padding(16.dp)
             .size(size)
             .semantics { contentDescription = "$text のQRコード" },
     ) {
-        val cell = this.size.width / matrix.width
-        for (y in 0 until matrix.height) {
-            for (x in 0 until matrix.width) {
-                if (matrix[x, y]) {
-                    // 隣接セル間に隙間が出ないよう、わずかに大きく描く
-                    drawRect(
-                        color = Color.Black,
-                        topLeft = Offset(x * cell, y * cell),
-                        size = Size(cell + 0.5f, cell + 0.5f),
-                    )
-                }
-            }
+        drawRect(Color.White)
+        // モジュール境界がピクセル境界に揃うよう整数ピクセルにし、余りは中央寄せで吸収する
+        val total = modules + QUIET_ZONE_MODULES * 2
+        val cell = (this.size.minDimension / total).toInt().coerceAtLeast(1).toFloat()
+        val origin = Offset(
+            (this.size.width - cell * modules) / 2f,
+            (this.size.height - cell * modules) / 2f,
+        ).let { Offset(it.x.toInt().toFloat(), it.y.toInt().toFloat()) }
+        translate(origin.x, origin.y) {
+            scale(scale = cell, pivot = Offset.Zero) { drawPath(path, Color.Black) }
         }
     }
 }

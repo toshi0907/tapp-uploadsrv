@@ -295,7 +295,11 @@ private fun ServerCard(settings: AppSettings, folderValid: Boolean) {
 
             when (val s = state) {
                 is ServerState.Running -> {
-                    val addresses = remember(s) { NetworkUtils.localIpv4Addresses() }
+                    var addresses by remember(s) { mutableStateOf(NetworkUtils.localIpv4Addresses()) }
+                    // Wi-Fiの切り替え等でIPが変わることがあるため、画面復帰のたびに取り直す
+                    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
+                        addresses = NetworkUtils.localIpv4Addresses()
+                    }
                     Text(text = "接続URL(同じWi-Fiのブラウザで開く)")
                     if (addresses.isEmpty()) {
                         Text(
@@ -303,24 +307,24 @@ private fun ServerCard(settings: AppSettings, folderValid: Boolean) {
                             color = MaterialTheme.colorScheme.error,
                         )
                     } else {
-                        Text(text = "スマホ等のカメラでQRコードを読み取っても開けます")
-                        addresses.forEach { ip ->
-                            val url = "http://$ip:${s.port}"
-                            Column(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalAlignment = Alignment.CenterHorizontally,
-                                verticalArrangement = Arrangement.spacedBy(8.dp),
-                            ) {
-                                SelectionContainer {
+                        val urls = addresses.map { ip -> "http://$ip:${s.port}" }
+                        SelectionContainer {
+                            Column {
+                                urls.forEach { url ->
                                     Text(
                                         text = url,
                                         style = MaterialTheme.typography.titleMedium,
                                         color = MaterialTheme.colorScheme.primary,
                                     )
                                 }
-                                QrCode(text = url)
                             }
                         }
+                        // 先頭(Wi-Fi優先)のURLだけをQRコードにする。モバイル回線等のアドレスは同じWi-Fiから届かないため
+                        Text(text = "カメラで読み取ると ${urls.first()} を開けます")
+                        QrCode(
+                            text = urls.first(),
+                            modifier = Modifier.align(Alignment.CenterHorizontally),
+                        )
                     }
                 }
                 is ServerState.Failed -> Text(text = s.message, color = MaterialTheme.colorScheme.error)
