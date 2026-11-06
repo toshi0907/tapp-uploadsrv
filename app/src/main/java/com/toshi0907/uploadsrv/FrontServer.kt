@@ -263,51 +263,55 @@ class FrontServer(
         val remaining = AtomicInteger(2)
         val downstreamDone = CountDownLatch(1)
         val finish = {
-            if (remaining.decrementAndGet() == 0) {
-                closeQuietly(client)
-                closeQuietly(upstream)
-            }
+            if (remaining.decrementAndGet() == 0) closeBoth(client, upstream)
         }
         val downstream = Runnable {
-            pump(upstream.getInputStream(), client.getOutputStream(), onChunk = { buf, len ->
-                if (logResponse) statusLine(buf, len)?.let { AccessLog.add(name, "応答: $it") }
-            }) { error ->
-                if (error != null && isUnexpected(client, upstream)) {
-                    AccessLog.add(name, "応答の送信中に切断されました: ${error.message}")
+            // 途中で例外が出ても、必ず完了を知らせる(呼び出し元が待ち続けないように)
+            try {
+                pump(upstream.getInputStream(), client.getOutputStream(), onChunk = { buf, len ->
+                    if (logResponse) statusLine(buf, len)?.let { AccessLog.add(name, "応答: $it") }
+                }) { error ->
+                    if (error != null && isUnexpected(client, upstream)) {
+                        AccessLog.add(name, "応答の送信中に切断されました: ${error.message}")
+                    }
+                    if (error != null) closeBoth(client, upstream) else halfClose(client, upstream)
                 }
-                if (error != null) closeBoth(client, upstream) else halfClose(client, upstream)
+            } catch (e: Exception) {
+                // ストリームを取得する前に相手側で閉じられた場合など
+                closeBoth(client, upstream)
+            } finally {
+                finish()
+                downstreamDone.countDown()
             }
-            finish()
-            downstreamDone.countDown()
         }
         try {
             pool.execute(downstream)
         } catch (e: Exception) {
             // 停止処理中でスレッドプールが受け付けない
-            closeQuietly(client)
-            closeQuietly(upstream)
+            closeBoth(client, upstream)
             return
         }
         // 同じ接続(keep-alive)で続けて送られたリクエストも記録する。最初の1件は呼び出し元で記録済み
         val prefix = if (client is SSLSocket) "HTTPS: " else "HTTP: "
-        pump(client.getInputStream(), upstream.getOutputStream(), onChunk = { buf, len ->
-            requestLine(buf, len)?.let { AccessLog.add(name, prefix + it) }
-        }) { error ->
-            if (error != null && isUnexpected(client, upstream)) {
-                val reason = if (error is SocketTimeoutException) {
-                    "${RELAY_IDLE_TIMEOUT_MS / 60_000}分間通信が無いため切断しました"
-                } else {
-                    "受信中に切断されました: ${error.message}"
+        try {
+            pump(client.getInputStream(), upstream.getOutputStream(), onChunk = { buf, len ->
+                requestLine(buf, len)?.let { AccessLog.add(name, prefix + it) }
+            }) { error ->
+                if (error != null && isUnexpected(client, upstream)) {
+                    val reason = if (error is SocketTimeoutException) {
+                        "${RELAY_IDLE_TIMEOUT_MS / 60_000}分間通信が無いため切断しました"
+                    } else {
+                        "受信中に切断されました: ${error.message}"
+                    }
+                    AccessLog.add(name, reason)
                 }
-                AccessLog.add(name, reason)
+                if (error != null) closeBoth(upstream, client) else halfClose(upstream, client)
             }
-            if (error != null) {
-                closeBoth(upstream, client)
-            } else {
-                halfClose(upstream, client)
-            }
+        } catch (e: Exception) {
+            closeBoth(client, upstream)
+        } finally {
+            finish()
         }
-        finish()
         try {
             // 受信側が送信を終えた後に応答が止まっても、いつまでも待ち続けない。
             // (ブロック中の read には後から soTimeout を設定しても効かないため、ソケットを閉じて抜けさせる)
