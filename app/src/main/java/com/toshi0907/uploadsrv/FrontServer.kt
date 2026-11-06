@@ -12,6 +12,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 import javax.net.ssl.SSLContext
@@ -304,13 +305,17 @@ class FrontServer(
                 closeBoth(upstream, client)
             } else {
                 halfClose(upstream, client)
-                // 受信側が送信を終えた後に応答が止まっても、いつまでも待ち続けない
-                runCatching { upstream.soTimeout = RELAY_IDLE_TIMEOUT_MS }
             }
         }
         finish()
         try {
-            downstreamDone.await()
+            // 受信側が送信を終えた後に応答が止まっても、いつまでも待ち続けない。
+            // (ブロック中の read には後から soTimeout を設定しても効かないため、ソケットを閉じて抜けさせる)
+            if (!downstreamDone.await(RELAY_IDLE_TIMEOUT_MS.toLong(), TimeUnit.MILLISECONDS)) {
+                AccessLog.add(name, "${RELAY_IDLE_TIMEOUT_MS / 60_000}分間応答が完了しないため切断しました")
+                closeBoth(client, upstream)
+                downstreamDone.await()
+            }
         } catch (e: InterruptedException) {
             // 停止処理(shutdownNow)による割り込み
             closeBoth(client, upstream)
