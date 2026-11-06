@@ -45,6 +45,15 @@ class UploadServer(context: Context, private val port: Int) {
 
     /** サーバーを起動する。ポート使用中などで失敗した場合は例外を投げる(後始末は [stop])。 */
     suspend fun start() {
+        // HTTPS を準備できなくても HTTP だけで動かす
+        val ssl = runCatching { TlsIdentity.sslContext(File(appContext.filesDir, "tls"), NetworkUtils.localIpv4Addresses()) }
+            .onFailure { AccessLog.add("-", "HTTPSの証明書を準備できませんでした: ${it.message}") }
+            .getOrNull()
+        // 公開ポートを先に確保する(Ktorの空きポート割り当てに同じ番号を取られないように)
+        val publicServer = FrontServer(port, ssl)
+        front = publicServer
+        publicServer.bind()
+
         val engine = embeddedServer(CIO, port = 0, host = LOOPBACK) {
             routing {
                 get("/") {
@@ -58,11 +67,7 @@ class UploadServer(context: Context, private val port: Int) {
         engine.start(wait = false)
         server = engine
         val backendPort = engine.engine.resolvedConnectors().first().port
-        // HTTPS を準備できなくても HTTP だけで動かす
-        val ssl = runCatching { TlsIdentity.sslContext(File(appContext.filesDir, "tls"), NetworkUtils.localIpv4Addresses()) }
-            .onFailure { AccessLog.add("-", "HTTPSの証明書を準備できませんでした: ${it.message}") }
-            .getOrNull()
-        front = FrontServer(port, backendPort, ssl).also { it.start() }
+        publicServer.start(backendPort)
     }
 
     fun stop() {

@@ -45,7 +45,7 @@ object TlsIdentity {
      */
     fun sslContext(dir: File, ipAddresses: List<String>): SSLContext {
         val now = Date()
-        val (key, cert) = load(dir)?.takeIf { (_, c) -> isUsable(c, ipAddresses, now) }
+        val (key, cert) = load(dir)?.takeIf { (k, c) -> isUsable(k, c, ipAddresses, now) }
             ?: create(ipAddresses, now).also { save(dir, it.first, it.second) }
         val keyStore = KeyStore.getInstance(KeyStore.getDefaultType()).apply {
             load(null, null)
@@ -65,14 +65,33 @@ object TlsIdentity {
         key to parseCertificate(certFile.readBytes())
     }.getOrNull()
 
-    private fun isUsable(cert: X509Certificate, ipAddresses: List<String>, now: Date): Boolean {
+    private fun isUsable(key: PrivateKey, cert: X509Certificate, ipAddresses: List<String>, now: Date): Boolean {
+        // 端末の時計が進んでいた時期に作った証明書(まだ有効期間前)も作り直す
+        if (cert.notBefore.after(now)) return false
         if (cert.notAfter.time - now.time < RENEW_BEFORE_DAYS * DAY_MS) return false
+        // 保存の途中で中断した等で鍵と証明書が対応していなければ作り直す
+        if (!matches(key, cert)) return false
         val names = runCatching { cert.subjectAlternativeNames }.getOrNull().orEmpty()
             .filter { it.size >= 2 && it[0] == SAN_IP }
             .map { it[1].toString() }
             .toSet()
         return names.containsAll(ipAddresses)
     }
+
+    /** [key] で署名したものを [cert] の公開鍵で検証できるか。 */
+    private fun matches(key: PrivateKey, cert: X509Certificate): Boolean = runCatching {
+        val data = "uploadsrv".toByteArray()
+        val signature = Signature.getInstance(SIGNATURE_ALGORITHM).run {
+            initSign(key)
+            update(data)
+            sign()
+        }
+        Signature.getInstance(SIGNATURE_ALGORITHM).run {
+            initVerify(cert.publicKey)
+            update(data)
+            verify(signature)
+        }
+    }.getOrDefault(false)
 
     private fun save(dir: File, key: PrivateKey, cert: X509Certificate) {
         dir.mkdirs()
@@ -103,7 +122,7 @@ object TlsIdentity {
             keyPair.public.encoded, // SubjectPublicKeyInfo(DER)
             tlv(0xA3, extensions(ipAddresses)),
         )
-        val signature = Signature.getInstance("SHA256withECDSA").run {
+        val signature = Signature.getInstance(SIGNATURE_ALGORITHM).run {
             initSign(keyPair.private)
             update(tbs)
             sign()
@@ -152,6 +171,7 @@ object TlsIdentity {
     private const val OID_SUBJECT_ALT_NAME = "2.5.29.17"
     private const val OID_SERVER_AUTH = "1.3.6.1.5.5.7.3.1"
     private const val SAN_IP = 7
+    private const val SIGNATURE_ALGORITHM = "SHA256withECDSA"
     private const val LOCALHOST_IP = "127.0.0.1"
 
     private fun tlv(tag: Int, value: ByteArray): ByteArray {

@@ -339,8 +339,9 @@ private fun ServerCard(settings: AppSettings, folderValid: Boolean) {
                                 )
                             }
                         }
+                        val alternatives = if (s.https) "別のブラウザ(Brave等)や https:// のURL" else "別のブラウザ(Brave等)"
                         Text(
-                            text = "開けない場合は、別のブラウザ(Brave等)や https:// のURLを試してください。" +
+                            text = "開けない場合は、${alternatives}を試してください。" +
                                 "下の「接続ログ」で、通信が届いているかを確認できます",
                             style = MaterialTheme.typography.bodySmall,
                         )

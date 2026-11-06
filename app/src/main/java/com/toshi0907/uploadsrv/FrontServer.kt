@@ -10,6 +10,7 @@ import java.net.Socket
 import java.net.SocketTimeoutException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
+import java.util.concurrent.Semaphore
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 import javax.net.ssl.SSLContext
@@ -22,14 +23,21 @@ import javax.net.ssl.SSLSocket
  *   (CIO は TLS に対応しておらず、TLS が届くと無応答で切断してしまうため)
  * - TLS は内部の SSLServerSocket で復号してから CIO へ渡す
  * - 接続ごとの経過を [AccessLog] に記録する(接続できない原因の診断用)
+ *
+ * 公開ポートを先に確保するため、[bind] → (Ktor起動) → [start] の順で使う。
  */
 class FrontServer(
     private val port: Int,
-    private val backendPort: Int,
     private val sslContext: SSLContext?,
 ) {
     private val pool: ExecutorService = Executors.newCachedThreadPool()
     private val sockets: MutableSet<Socket> = ConcurrentHashMap.newKeySet()
+
+    /** 同時に処理する公開側の接続数の上限(多数の接続で資源を使い切らないため)。 */
+    private val connectionSlots = Semaphore(MAX_CONNECTIONS)
+
+    @Volatile
+    private var backendPort = 0
 
     /** 内部TLSサーバーへ中継した接続の、ループバック側ポート → 元の接続元。 */
     private val tlsOrigins = ConcurrentHashMap<Int, String>()
@@ -42,8 +50,11 @@ class FrontServer(
     /** HTTPS を受け付けられるか([start] 後に有効)。 */
     val httpsAvailable: Boolean get() = tlsListener != null
 
-    /** 公開ポートで待ち受けを始める。ポート使用中などで失敗した場合は例外を投げる。 */
-    fun start() {
+    /**
+     * 公開ポートを確保する(まだ接続は処理しない)。Ktorの空きポートより先に確保し、
+     * Ktorに同じ番号を取られないようにする。ポート使用中などで失敗した場合は例外を投げる。
+     */
+    fun bind() {
         val front = ServerSocket()
         try {
             front.reuseAddress = true
@@ -54,14 +65,20 @@ class FrontServer(
             throw e
         }
         listener = front
+    }
+
+    /** [bind] 済みのポートで、[backendPort] のKtorへの中継を始める。 */
+    fun start(backendPort: Int) {
+        val front = checkNotNull(listener) { "bind() has not been called" }
+        this.backendPort = backendPort
         tlsListener = sslContext?.let { ctx ->
             runCatching {
-                ctx.serverSocketFactory.createServerSocket(0, 50, InetAddress.getLoopbackAddress()) as SSLServerSocket
+                ctx.serverSocketFactory.createServerSocket(0, 50, LOOPBACK) as SSLServerSocket
             }.onFailure { AccessLog.add("-", "HTTPSを準備できませんでした: ${it.message}") }
                 .getOrNull()
         }
-        tlsListener?.let { tls -> pool.execute { acceptLoop(tls) { handleTls(it as SSLSocket) } } }
-        pool.execute { acceptLoop(front, ::handleFront) }
+        tlsListener?.let { tls -> pool.execute { acceptLoop(tls, limit = null) { handleTls(it as SSLSocket) } } }
+        pool.execute { acceptLoop(front, limit = connectionSlots, handle = ::handleFront) }
     }
 
     fun stop() {
@@ -73,7 +90,8 @@ class FrontServer(
         pool.shutdownNow()
     }
 
-    private fun acceptLoop(server: ServerSocket, handle: (Socket) -> Unit) {
+    /** [limit] があれば、その数を超える同時接続は受け付けてすぐ閉じる。 */
+    private fun acceptLoop(server: ServerSocket, limit: Semaphore?, handle: (Socket) -> Unit) {
         while (!stopped) {
             val socket = try {
                 server.accept()
@@ -85,6 +103,11 @@ class FrontServer(
                 continue
             }
             sockets += socket
+            if (limit != null && !limit.tryAcquire()) {
+                AccessLog.add(clientName(socket), "同時接続数の上限(${MAX_CONNECTIONS})を超えたため切断しました")
+                closeQuietly(socket)
+                continue
+            }
             try {
                 pool.execute {
                     try {
@@ -92,11 +115,14 @@ class FrontServer(
                     } catch (e: Exception) {
                         AccessLog.add(clientName(socket), "処理中にエラーが発生しました: ${e.message}")
                         closeQuietly(socket)
+                    } finally {
+                        limit?.release()
                     }
                 }
             } catch (e: Exception) {
                 // 停止処理中でスレッドプールが受け付けない
                 closeQuietly(socket)
+                limit?.release()
             }
         }
     }
@@ -122,7 +148,8 @@ class FrontServer(
             closeQuietly(client)
             return
         }
-        client.soTimeout = 0
+        // 無通信のまま放置された接続が資源を持ち続けないよう、中継中も時間制限を付ける
+        client.soTimeout = RELAY_IDLE_TIMEOUT_MS
 
         val first = buffer[0].toInt() and 0xFF
         val target = if (first == TLS_HANDSHAKE) {
@@ -186,7 +213,7 @@ class FrontServer(
             closeQuietly(socket)
             return
         }
-        socket.soTimeout = 0
+        socket.soTimeout = RELAY_IDLE_TIMEOUT_MS
         AccessLog.add(name, "HTTPS: ${requestLine(buffer, read) ?: "(リクエストを解釈できません)"}")
         val backend = connect(backendPort)
         if (backend == null) {
@@ -215,7 +242,7 @@ class FrontServer(
         val socket = Socket()
         sockets += socket
         return try {
-            socket.connect(InetSocketAddress(InetAddress.getLoopbackAddress(), targetPort), CONNECT_TIMEOUT_MS)
+            socket.connect(InetSocketAddress(LOOPBACK, targetPort), CONNECT_TIMEOUT_MS)
             beforeUse(socket)
             socket
         } catch (e: IOException) {
@@ -227,6 +254,7 @@ class FrontServer(
     /**
      * [client] と [upstream] の間で双方向にデータを流す。呼び出したスレッドが「上り」を担当し、
      * 「下り」は別スレッドで流す。両方向が終わったら両方のソケットを閉じる。
+     * 片方向が正常に終わった(EOF)ときは相手側の送信だけを閉じ、エラーのときは両方閉じる。
      */
     private fun relay(name: String, client: Socket, upstream: Socket, logResponse: Boolean) {
         val remaining = AtomicInteger(2)
@@ -243,7 +271,7 @@ class FrontServer(
                 if (error != null && isUnexpected(client, upstream)) {
                     AccessLog.add(name, "応答の送信中に切断されました: ${error.message}")
                 }
-                halfClose(client, upstream)
+                if (error != null) closeBoth(client, upstream) else halfClose(client, upstream)
             }
             finish()
         }
@@ -261,9 +289,14 @@ class FrontServer(
             requestLine(buf, len)?.let { AccessLog.add(name, prefix + it) }
         }) { error ->
             if (error != null && isUnexpected(client, upstream)) {
-                AccessLog.add(name, "受信中に切断されました: ${error.message}")
+                val reason = if (error is SocketTimeoutException) {
+                    "${RELAY_IDLE_TIMEOUT_MS / 60_000}分間通信が無いため切断しました"
+                } else {
+                    "受信中に切断されました: ${error.message}"
+                }
+                AccessLog.add(name, reason)
             }
-            halfClose(upstream, client)
+            if (error != null) closeBoth(upstream, client) else halfClose(upstream, client)
         }
         finish()
     }
@@ -295,10 +328,12 @@ class FrontServer(
     /** [to] への送信を終える。TLSソケットは片側だけ閉じられないので両方閉じる。 */
     private fun halfClose(to: Socket, other: Socket) {
         val ok = runCatching { to.shutdownOutput() }.isSuccess
-        if (!ok || to is SSLSocket) {
-            closeQuietly(to)
-            closeQuietly(other)
-        }
+        if (!ok || to is SSLSocket) closeBoth(to, other)
+    }
+
+    private fun closeBoth(a: Socket, b: Socket) {
+        closeQuietly(a)
+        closeQuietly(b)
     }
 
     /** 自分で閉じたソケットによるエラーは記録しない。 */
@@ -320,6 +355,14 @@ class FrontServer(
         private const val MAX_LOG_LINE = 200
         private const val MAX_LINE_SCAN = 8 * 1024
         private const val ACCEPT_RETRY_DELAY_MS = 200L
+        private const val MAX_CONNECTIONS = 64
+        private const val RELAY_IDLE_TIMEOUT_MS = 5 * 60_000
+
+        /**
+         * Ktor と内部TLSサーバーの待ち受けアドレス。Android の getLoopbackAddress() は
+         * IPv6 の ::1 を返すため、127.0.0.1 を明示する。
+         */
+        private val LOOPBACK: InetAddress = InetAddress.getByAddress("localhost", byteArrayOf(127, 0, 0, 1))
 
         /** 先頭行が HTTP のリクエスト行(例: "GET / HTTP/1.1")なら返す。 */
         internal fun requestLine(buf: ByteArray, len: Int): String? {

@@ -4,6 +4,7 @@ import android.content.Context
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -44,6 +45,9 @@ object ServerController {
             _state.value = ServerState.Running(port, newServer.httpsAvailable)
             newServer
         } catch (e: CancellationException) {
+            // 起動途中で取り消されても、ポートを掴んだままにしない
+            withContext(NonCancellable + Dispatchers.IO) { runCatching { newServer.stop() } }
+            _state.value = ServerState.Stopped
             throw e
         } catch (e: Exception) {
             withContext(Dispatchers.IO) { runCatching { newServer.stop() } }
