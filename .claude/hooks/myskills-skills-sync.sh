@@ -47,13 +47,28 @@ fi
 # submoduleの更新はClaude Code on the web(使い捨て環境)でのみ自動実行する。
 # ローカル(永続環境)は明示的な `git submodule update --init --remote` を想定。
 # 更新に失敗しても(ネットワーク/プロキシ等)、既存の内容でsymlink同期は続行する。
+# 同期前にスキル本体が無かった(submodule未初期化)場合は、同期後に
+# Claude Code へスキルの再スキャン(reloadSkills)を要求する。
+had_skills_src=false
+[ -d .myskills/claude-skills ] && had_skills_src=true
+
 if [ "${CLAUDE_CODE_REMOTE:-}" = "true" ]; then
+  # ネットワークが詰まってもセッション開始を長時間ブロックしないよう時間を制限する
+  # (SessionStart hook は同期実行される)。
+  timeout_cmd=()
+  command -v timeout >/dev/null 2>&1 && timeout_cmd=(timeout "${MYSKILLS_SYNC_TIMEOUT:-60}")
   # --remote: myskills側の最新コミットを取得する
   # --init:   初回clone直後でsubmoduleが未初期化でも動くようにする
-  if git submodule update --init --remote -- .myskills >&2; then
+  if "${timeout_cmd[@]}" git submodule update --init --remote -- .myskills >&2; then
     log "submodule synced to $(git -C .myskills rev-parse --short HEAD)"
   else
     log "警告: submodule の更新に失敗しました。既存の内容のまま続行します。"
+    # 追跡ブランチが無くなった等で --remote だけが失敗した場合に備え、
+    # 未初期化なら親リポジトリが記録しているコミットでの初期化を試みる。
+    if [ ! -d .myskills/claude-skills ]; then
+      "${timeout_cmd[@]}" git submodule update --init -- .myskills >&2 ||
+        log "警告: 記録済みコミットでの submodule 初期化にも失敗しました。"
+    fi
   fi
 fi
 
@@ -121,7 +136,8 @@ while IFS= read -r -d '' entry; do
         pending+=("$path")
       elif [ ! -e "$path" ] && [ ! -L "$path" ]; then
         # 削除済み: コミット済みの内容(symlinkのリンク先)で判定する
-        case "$(git cat-file -p "HEAD:$path" 2>/dev/null)" in
+        # (未コミットでステージのみされていた場合に備え、indexも確認する)
+        case "$(git cat-file -p "HEAD:$path" 2>/dev/null || git cat-file -p ":$path" 2>/dev/null)" in
           "$link_prefix"*) pending+=("$path") ;;
         esac
       fi
@@ -130,9 +146,28 @@ while IFS= read -r -d '' entry; do
 done < <(git status --porcelain -z --no-renames --ignore-submodules=dirty \
            -- .myskills .claude/skills)
 
+message=""
 if [ "${#pending[@]}" -gt 0 ]; then
-  echo "myskills-skills-sync: myskills同期による未コミットの差分があります: ${pending[*]}"
-  echo "作業内容とは混ぜず、上記パスだけを専用のコミット(例: chore: sync myskills)としてコミットしてください。"
+  message="myskills-skills-sync: myskills同期による未コミットの差分があります: ${pending[*]}
+作業内容とは混ぜず、上記パスだけを専用のコミット(例: chore: sync myskills)としてコミットしてください。"
+fi
+
+# スキル本体を新たに取得した、またはsymlinkを追加した場合は、セッション開始時の
+# スキル探索に間に合っていない可能性があるため reloadSkills で再スキャンさせる。
+# その場合は JSON 出力とし、差分の案内は additionalContext に入れる。
+if [ "$had_skills_src" = false ] || [ "${#added[@]}" -gt 0 ]; then
+  json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    printf '%s' "$s"
+  }
+  printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","reloadSkills":true'
+  [ -n "$message" ] && printf ',"additionalContext":"%s"' "$(json_escape "$message")"
+  printf '}}\n'
+elif [ -n "$message" ]; then
+  echo "$message"
 fi
 
 exit 0
