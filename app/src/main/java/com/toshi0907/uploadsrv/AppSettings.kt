@@ -26,6 +26,11 @@ class AppSettings(context: Context) {
             prefs.edit { putInt(KEY_PORT, value) }
         }
 
+    /** 更新通知を出した最後のビルド番号(同じビルドで何度も通知しないため)。 */
+    var lastNotifiedUpdateBuild: Int
+        get() = prefs.getInt(KEY_LAST_NOTIFIED_UPDATE_BUILD, 0)
+        set(value) = prefs.edit { putInt(KEY_LAST_NOTIFIED_UPDATE_BUILD, value) }
+
     /**
      * SAFで選択されたフォルダを保存先として登録する。
      * 権限を永続化し、以前のフォルダの永続権限は解放する。
@@ -59,6 +64,7 @@ class AppSettings(context: Context) {
         private const val PREFS_NAME = "settings"
         private const val KEY_SAVE_FOLDER_URI = "save_folder_uri"
         private const val KEY_PORT = "port"
+        private const val KEY_LAST_NOTIFIED_UPDATE_BUILD = "last_notified_update_build"
 
         /** 一般アプリが待ち受けできる範囲(1024〜65535)か。 */
         fun isValidPort(port: Int): Boolean = port in 1024..65535
