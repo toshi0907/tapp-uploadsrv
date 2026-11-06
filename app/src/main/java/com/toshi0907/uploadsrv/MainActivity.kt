@@ -1,5 +1,9 @@
 package com.toshi0907.uploadsrv
 
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -29,7 +33,6 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -37,9 +40,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
-import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -135,7 +138,9 @@ private fun MainScreen(modifier: Modifier = Modifier) {
 @Composable
 private fun ServerCard(settings: AppSettings, folderValid: Boolean) {
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
+    val requestNotification = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { UploadService.start(context) }
     val state by ServerController.state.collectAsState()
     var portText by remember { mutableStateOf(settings.port.toString()) }
     val portValue = portText.toIntOrNull()?.takeIf(AppSettings::isValidPort)
@@ -156,13 +161,16 @@ private fun ServerCard(settings: AppSettings, folderValid: Boolean) {
                     checked = running,
                     enabled = running || (folderValid && portValue != null),
                     onCheckedChange = { on ->
-                        scope.launch {
-                            if (on && portValue != null) {
-                                settings.port = portValue
-                                ServerController.start(context, portValue)
+                        if (on && portValue != null) {
+                            settings.port = portValue
+                            // 通知を出せなくてもサービスは動くため、許可の結果に関わらず起動する
+                            if (needsNotificationPermission(context)) {
+                                requestNotification.launch(Manifest.permission.POST_NOTIFICATIONS)
                             } else {
-                                ServerController.stop()
+                                UploadService.start(context)
                             }
+                        } else {
+                            UploadService.stop(context)
                         }
                     },
                 )
@@ -213,3 +221,9 @@ private fun ServerCard(settings: AppSettings, folderValid: Boolean) {
         }
     }
 }
+
+/** Android 13 以降で通知の許可がまだ無いか。 */
+private fun needsNotificationPermission(context: Context): Boolean =
+    Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+        ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
+        PackageManager.PERMISSION_GRANTED
