@@ -8,8 +8,10 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
@@ -23,16 +25,21 @@ import kotlinx.coroutines.launch
 /**
  * アップロードサーバーを常駐させるフォアグラウンドサービス(種別: specialUse)。
  * 通知に接続URLと「停止」ボタンを表示する。
+ * 稼働中は Wi-Fi の省電力切断やCPUスリープで受信が止まらないよう WifiLock / WakeLock を保持する。
  */
 class UploadService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var stateJob: Job? = null
     private var serverToken: Any? = null
+    private var wifiLock: WifiManager.WifiLock? = null
+    private var wakeLock: PowerManager.WakeLock? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
+            // ユーザー操作による停止なので、端末起動時の自動起動も行わない
+            AppSettings(this).serverEnabled = false
             scope.launch {
                 ServerController.stop()
                 stopSelfAndForeground()
@@ -61,7 +68,10 @@ class UploadService : Service() {
         stateJob = scope.launch {
             ServerController.state.collect { state ->
                 when (state) {
-                    is ServerState.Running -> notify(buildNotification(urlText(state.port)))
+                    is ServerState.Running -> {
+                        acquireLocks()
+                        notify(buildNotification(urlText(state.port)))
+                    }
                     else -> stopSelfAndForeground()
                 }
             }
@@ -70,6 +80,7 @@ class UploadService : Service() {
 
     override fun onDestroy() {
         scope.cancel()
+        releaseLocks()
         // サービスが破棄される場合はサーバーも止める(ソケットを残さない)。
         // メインスレッドを塞がないよう、プロセス全体のスコープで非同期に止める
         ServerController.stopAsync(serverToken)
@@ -78,8 +89,38 @@ class UploadService : Service() {
 
     private fun stopSelfAndForeground() {
         stateJob?.cancel()
+        releaseLocks()
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         stopSelf()
+    }
+
+    /** サーバー稼働中に保持するロックを取得する(取得済みなら何もしない)。 */
+    private fun acquireLocks() {
+        if (wifiLock == null) {
+            val wifi = applicationContext.getSystemService(WifiManager::class.java)
+            // HIGH_PERF は Android 14 で非推奨だが、それ未満では省電力によるWi-Fi切断の抑止に有効
+            @Suppress("DEPRECATION")
+            val mode = WifiManager.WIFI_MODE_FULL_HIGH_PERF
+            wifiLock = wifi?.createWifiLock(mode, LOCK_TAG)?.apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        }
+        if (wakeLock == null) {
+            val power = getSystemService(PowerManager::class.java)
+            // サーバー稼働中はずっと保持し、停止時に必ず解放するためタイムアウトは付けない
+            wakeLock = power?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, LOCK_TAG)?.apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        }
+    }
+
+    private fun releaseLocks() {
+        wifiLock?.let { if (it.isHeld) it.release() }
+        wifiLock = null
+        wakeLock?.let { if (it.isHeld) it.release() }
+        wakeLock = null
     }
 
     private fun startInForeground(notification: Notification) {
@@ -134,6 +175,7 @@ class UploadService : Service() {
     companion object {
         private const val CHANNEL_ID = "server"
         private const val NOTIFICATION_ID = 1
+        private const val LOCK_TAG = "uploadsrv:server"
         private const val ACTION_STOP = "com.toshi0907.uploadsrv.action.STOP"
 
         fun start(context: Context) {

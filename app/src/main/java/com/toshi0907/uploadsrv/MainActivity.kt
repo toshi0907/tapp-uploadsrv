@@ -1,11 +1,16 @@
 package com.toshi0907.uploadsrv
 
 import android.Manifest
+import android.annotation.SuppressLint
+import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -151,6 +156,8 @@ private fun MainScreen(modifier: Modifier = Modifier) {
 
         ServerCard(settings = settings, folderValid = folder.valid)
 
+        BatteryOptimizationCard()
+
         UpdateCard()
     }
 }
@@ -258,6 +265,7 @@ private fun ServerCard(settings: AppSettings, folderValid: Boolean) {
                     onCheckedChange = { on ->
                         if (on && portValue != null) {
                             settings.port = portValue
+                            settings.serverEnabled = true
                             // 通知を出せなくてもサービスは動くため、許可の結果に関わらず起動する
                             if (needsNotificationPermission(context)) {
                                 requestNotification.launch(Manifest.permission.POST_NOTIFICATIONS)
@@ -314,6 +322,61 @@ private fun ServerCard(settings: AppSettings, folderValid: Boolean) {
                 )
             }
         }
+    }
+}
+
+/**
+ * 電池最適化の除外を案内するカード(任意)。
+ * 最適化対象のままだと Doze 中にネットワークが止まり、アップロードを受けられないことがある。
+ */
+@Composable
+private fun BatteryOptimizationCard() {
+    val context = LocalContext.current
+    var ignoring by remember { mutableStateOf(isIgnoringBatteryOptimizations(context)) }
+
+    // 設定画面から戻ったときに状態を反映する
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
+        ignoring = isIgnoringBatteryOptimizations(context)
+    }
+
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(text = "電池の最適化", style = MaterialTheme.typography.titleMedium)
+            if (ignoring) {
+                Text(text = "除外済みです(バックグラウンドでも受信を続けやすくなります)")
+            } else {
+                Text(
+                    text = "画面オフ中も安定して受信するには、電池の最適化からこのアプリを除外してください(任意)",
+                )
+                Button(onClick = { requestIgnoreBatteryOptimizations(context) }) {
+                    Text(text = "最適化を除外する")
+                }
+            }
+        }
+    }
+}
+
+private fun isIgnoringBatteryOptimizations(context: Context): Boolean =
+    context.getSystemService(PowerManager::class.java)
+        ?.isIgnoringBatteryOptimizations(context.packageName) == true
+
+@SuppressLint("BatteryLife")
+private fun requestIgnoreBatteryOptimizations(context: Context) {
+    val request = Intent(
+        Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+        Uri.parse("package:${context.packageName}"),
+    )
+    try {
+        context.startActivity(request)
+    } catch (e: ActivityNotFoundException) {
+        // 確認ダイアログを持たない端末では一覧画面を開く
+        runCatching { context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }
+            .onFailure {
+                Toast.makeText(context, "電池の最適化の設定画面を開けませんでした", Toast.LENGTH_LONG).show()
+            }
     }
 }
 
