@@ -18,6 +18,14 @@ class AppSettings(context: Context) {
         get() = prefs.getString(KEY_SAVE_FOLDER_URI, null)?.let(Uri::parse)
         private set(value) = prefs.edit { putString(KEY_SAVE_FOLDER_URI, value?.toString()) }
 
+    /** HTTPサーバーの待ち受けポート。 */
+    var port: Int
+        get() = prefs.getInt(KEY_PORT, DEFAULT_PORT)
+        set(value) {
+            require(isValidPort(value)) { "invalid port: $value" }
+            prefs.edit { putInt(KEY_PORT, value) }
+        }
+
     /**
      * SAFで選択されたフォルダを保存先として登録する。
      * 権限を永続化し、以前のフォルダの永続権限は解放する。
@@ -46,8 +54,13 @@ class AppSettings(context: Context) {
     fun saveFolder(): DocumentFile? =
         saveFolderUri?.let { DocumentFile.fromTreeUri(appContext, it) }
 
-    private companion object {
-        const val PREFS_NAME = "settings"
-        const val KEY_SAVE_FOLDER_URI = "save_folder_uri"
+    companion object {
+        const val DEFAULT_PORT = 8080
+        private const val PREFS_NAME = "settings"
+        private const val KEY_SAVE_FOLDER_URI = "save_folder_uri"
+        private const val KEY_PORT = "port"
+
+        /** 一般アプリが待ち受けできる範囲(1024〜65535)か。 */
+        fun isValidPort(port: Int): Boolean = port in 1024..65535
     }
 }

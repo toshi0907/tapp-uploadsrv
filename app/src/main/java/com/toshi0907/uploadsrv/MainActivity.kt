@@ -9,25 +9,37 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -76,7 +88,9 @@ private fun MainScreen(modifier: Modifier = Modifier) {
     }
 
     Column(
-        modifier = modifier.padding(16.dp),
+        modifier = modifier
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         Text(
@@ -109,9 +123,93 @@ private fun MainScreen(modifier: Modifier = Modifier) {
             }
         }
 
+        ServerCard(settings = settings, folderValid = folder.valid)
+
         Text(
             text = "ビルド番号: ${BuildConfig.VERSION_CODE}",
             style = MaterialTheme.typography.bodySmall,
         )
+    }
+}
+
+@Composable
+private fun ServerCard(settings: AppSettings, folderValid: Boolean) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val state by ServerController.state.collectAsState()
+    var portText by remember { mutableStateOf(settings.port.toString()) }
+    val portValue = portText.toIntOrNull()?.takeIf(AppSettings::isValidPort)
+    val running = state is ServerState.Running
+
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "サーバー",
+                    style = MaterialTheme.typography.titleMedium,
+                    modifier = Modifier.weight(1f),
+                )
+                Switch(
+                    checked = running,
+                    enabled = running || (folderValid && portValue != null),
+                    onCheckedChange = { on ->
+                        scope.launch {
+                            if (on && portValue != null) {
+                                settings.port = portValue
+                                ServerController.start(context, portValue)
+                            } else {
+                                ServerController.stop()
+                            }
+                        }
+                    },
+                )
+            }
+
+            OutlinedTextField(
+                value = portText,
+                onValueChange = { text -> portText = text.filter(Char::isDigit).take(5) },
+                label = { Text("ポート番号") },
+                singleLine = true,
+                enabled = !running,
+                isError = portValue == null,
+                supportingText = {
+                    Text(if (portValue == null) "1024〜65535 を入力してください" else "初期値は ${AppSettings.DEFAULT_PORT}")
+                },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                modifier = Modifier.fillMaxWidth(),
+            )
+
+            when (val s = state) {
+                is ServerState.Running -> {
+                    val addresses = remember(s) { NetworkUtils.localIpv4Addresses() }
+                    Text(text = "接続URL(同じWi-Fiのブラウザで開く)")
+                    if (addresses.isEmpty()) {
+                        Text(
+                            text = "IPアドレスを取得できません。Wi-Fi接続を確認してください",
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    } else {
+                        SelectionContainer {
+                            Column {
+                                addresses.forEach { ip ->
+                                    Text(
+                                        text = "http://$ip:${s.port}",
+                                        style = MaterialTheme.typography.titleMedium,
+                                        color = MaterialTheme.colorScheme.primary,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+                is ServerState.Failed -> Text(text = s.message, color = MaterialTheme.colorScheme.error)
+                ServerState.Stopped -> Text(
+                    text = if (folderValid) "停止中" else "保存先フォルダを選択すると起動できます",
+                )
+            }
+        }
     }
 }

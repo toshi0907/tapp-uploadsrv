@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>アップロードサーバー</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 16px; background: #f5f5f5; color: #222; }
+  main { max-width: 640px; margin: 0 auto; }
+  h1 { font-size: 1.4rem; }
+  #drop { border: 2px dashed #888; border-radius: 12px; padding: 32px 16px; text-align: center; background: #fff; }
+  #drop.over { border-color: #1565c0; background: #e3f2fd; }
+  button { margin-top: 12px; padding: 10px 20px; font-size: 1rem; }
+  ul { list-style: none; padding: 0; }
+  li { background: #fff; margin: 6px 0; padding: 8px 12px; border-radius: 8px; word-break: break-all; }
+  .ok { color: #2e7d32; }
+  .ng { color: #c62828; }
+</style>
+</head>
+<body>
+<main>
+  <h1>写真・動画のアップロード</h1>
+  <div id="drop">
+    <p>ここにファイルをドラッグ&amp;ドロップ<br>または</p>
+    <input type="file" id="files" multiple accept="image/*,video/*">
+    <br>
+    <button id="send" disabled>アップロード</button>
+  </div>
+  <ul id="results"></ul>
+</main>
+<script>
+  const input = document.getElementById('files');
+  const drop = document.getElementById('drop');
+  const send = document.getElementById('send');
+  const results = document.getElementById('results');
+  let pending = [];
+
+  function setFiles(list) {
+    pending = Array.from(list);
+    send.disabled = pending.length === 0;
+    send.textContent = pending.length ? `アップロード(${pending.length}件)` : 'アップロード';
+  }
+
+  input.addEventListener('change', () => setFiles(input.files));
+  ['dragenter', 'dragover'].forEach(t => drop.addEventListener(t, e => {
+    e.preventDefault(); drop.classList.add('over');
+  }));
+  ['dragleave', 'drop'].forEach(t => drop.addEventListener(t, e => {
+    e.preventDefault(); drop.classList.remove('over');
+  }));
+  drop.addEventListener('drop', e => setFiles(e.dataTransfer.files));
+
+  function addResult(text, ok) {
+    const li = document.createElement('li');
+    li.textContent = text;
+    li.className = ok ? 'ok' : 'ng';
+    results.prepend(li);
+  }
+
+  // 1ファイルずつ順に送信する(1リクエストあたりのサイズを抑える)
+  send.addEventListener('click', async () => {
+    const files = pending;
+    setFiles([]);
+    input.value = '';
+    send.disabled = true;
+    for (const file of files) {
+      const form = new FormData();
+      form.append('file', file, file.name);
+      try {
+        const res = await fetch('/upload', { method: 'POST', body: form });
+        const text = await res.text();
+        addResult(res.ok ? `完了: ${file.name}` : `失敗: ${file.name}(${text})`, res.ok);
+      } catch (e) {
+        addResult(`失敗: ${file.name}(通信エラー)`, false);
+      }
+    }
+  });
+</script>
+</body>
+</html>
