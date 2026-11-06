@@ -9,6 +9,7 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketTimeoutException
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Semaphore
 import java.util.concurrent.Executors
@@ -255,9 +256,11 @@ class FrontServer(
      * [client] と [upstream] の間で双方向にデータを流す。呼び出したスレッドが「上り」を担当し、
      * 「下り」は別スレッドで流す。両方向が終わったら両方のソケットを閉じる。
      * 片方向が正常に終わった(EOF)ときは相手側の送信だけを閉じ、エラーのときは両方閉じる。
+     * 両方向が終わるまで戻らない(呼び出し元が持つ同時接続の枠を、中継が終わるまで解放しないため)。
      */
     private fun relay(name: String, client: Socket, upstream: Socket, logResponse: Boolean) {
         val remaining = AtomicInteger(2)
+        val downstreamDone = CountDownLatch(1)
         val finish = {
             if (remaining.decrementAndGet() == 0) {
                 closeQuietly(client)
@@ -274,6 +277,7 @@ class FrontServer(
                 if (error != null) closeBoth(client, upstream) else halfClose(client, upstream)
             }
             finish()
+            downstreamDone.countDown()
         }
         try {
             pool.execute(downstream)
@@ -296,9 +300,21 @@ class FrontServer(
                 }
                 AccessLog.add(name, reason)
             }
-            if (error != null) closeBoth(upstream, client) else halfClose(upstream, client)
+            if (error != null) {
+                closeBoth(upstream, client)
+            } else {
+                halfClose(upstream, client)
+                // 受信側が送信を終えた後に応答が止まっても、いつまでも待ち続けない
+                runCatching { upstream.soTimeout = RELAY_IDLE_TIMEOUT_MS }
+            }
         }
         finish()
+        try {
+            downstreamDone.await()
+        } catch (e: InterruptedException) {
+            // 停止処理(shutdownNow)による割り込み
+            closeBoth(client, upstream)
+        }
     }
 
     private fun pump(
