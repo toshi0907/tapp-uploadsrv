@@ -12,7 +12,7 @@ import kotlinx.coroutines.flow.update
 object AccessLog {
     data class Entry(val time: Long, val client: String, val message: String)
 
-    private const val MAX_ENTRIES = 100
+    private const val MAX_ENTRIES = 50
 
     private val _entries = MutableStateFlow<List<Entry>>(emptyList())
     val entries: StateFlow<List<Entry>> = _entries.asStateFlow()

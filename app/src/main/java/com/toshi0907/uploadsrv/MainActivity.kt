@@ -381,7 +381,7 @@ private fun AccessLogCard() {
             } else {
                 SelectionContainer {
                     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        entries.take(LOG_DISPLAY_LIMIT).forEach { entry ->
+                        entries.forEach { entry ->
                             Text(
                                 text = "${timeFormat.format(Date(entry.time))} ${entry.client}\n${entry.message}",
                                 style = MaterialTheme.typography.bodySmall,
@@ -393,8 +393,6 @@ private fun AccessLogCard() {
         }
     }
 }
-
-private const val LOG_DISPLAY_LIMIT = 50
 
 /**
  * 電池最適化の除外を案内するカード(任意)。

@@ -59,7 +59,7 @@ class UploadServer(context: Context, private val port: Int) {
         server = engine
         val backendPort = engine.engine.resolvedConnectors().first().port
         // HTTPS を準備できなくても HTTP だけで動かす
-        val ssl = runCatching { TlsIdentity.sslContext(File(appContext.filesDir, "tls")) }
+        val ssl = runCatching { TlsIdentity.sslContext(File(appContext.filesDir, "tls"), NetworkUtils.localIpv4Addresses()) }
             .onFailure { AccessLog.add("-", "HTTPSの証明書を準備できませんでした: ${it.message}") }
             .getOrNull()
         front = FrontServer(port, backendPort, ssl).also { it.start() }

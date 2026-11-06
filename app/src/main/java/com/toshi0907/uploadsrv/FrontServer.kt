@@ -44,9 +44,14 @@ class FrontServer(
 
     /** 公開ポートで待ち受けを始める。ポート使用中などで失敗した場合は例外を投げる。 */
     fun start() {
-        val front = ServerSocket().apply {
-            reuseAddress = true
-            bind(InetSocketAddress(port))
+        val front = ServerSocket()
+        try {
+            front.reuseAddress = true
+            front.bind(InetSocketAddress(port))
+        } catch (e: IOException) {
+            runCatching { front.close() }
+            pool.shutdownNow()
+            throw e
         }
         listener = front
         tlsListener = sslContext?.let { ctx ->
@@ -73,8 +78,11 @@ class FrontServer(
             val socket = try {
                 server.accept()
             } catch (e: IOException) {
-                if (!stopped) AccessLog.add("-", "接続の受け付けに失敗しました: ${e.message}")
-                if (server.isClosed) return else continue
+                if (stopped || server.isClosed) return
+                AccessLog.add("-", "接続の受け付けに失敗しました: ${e.message}")
+                // ファイル数の上限などで失敗し続ける場合に空回りしない
+                runCatching { Thread.sleep(ACCEPT_RETRY_DELAY_MS) }.onFailure { return }
+                continue
             }
             sockets += socket
             try {
@@ -128,7 +136,13 @@ class FrontServer(
             connect(tls.localPort) { tlsOrigins[it.localPort] = name }
         } else {
             val line = requestLine(buffer, read)
-            AccessLog.add(name, if (line != null) "HTTP: $line" else "不明なデータを受信しました(先頭: 0x%02X)".format(first))
+            val message = when {
+                line != null -> "HTTP: $line"
+                // リクエスト行が分割されて届いた場合など
+                first in 'A'.code..'Z'.code -> "HTTP: (先頭行を判別できません)"
+                else -> "不明なデータを受信しました(先頭: 0x%02X)".format(first)
+            }
+            AccessLog.add(name, message)
             connect(backendPort)
         }
         if (target == null) {
@@ -136,8 +150,7 @@ class FrontServer(
             closeQuietly(client)
             return
         }
-        target.getOutputStream().apply { write(buffer, 0, read); flush() }
-        relay(name, client, target, logResponse = first != TLS_HANDSHAKE)
+        forward(name, client, target, buffer, read, logResponse = first != TLS_HANDSHAKE)
     }
 
     /** 内部TLSサーバーに届いた接続。復号してからKtorへ中継する。 */
@@ -181,18 +194,34 @@ class FrontServer(
             closeQuietly(socket)
             return
         }
-        backend.getOutputStream().apply { write(buffer, 0, read); flush() }
-        relay(name, socket, backend, logResponse = true)
+        forward(name, socket, backend, buffer, read, logResponse = true)
     }
 
-    private fun connect(targetPort: Int, beforeUse: (Socket) -> Unit = {}): Socket? = try {
-        Socket().also { socket ->
-            sockets += socket
+    /** 受信済みの先頭データを [upstream] へ送り、以降を中継する。失敗したら両方閉じる。 */
+    private fun forward(name: String, client: Socket, upstream: Socket, head: ByteArray, len: Int, logResponse: Boolean) {
+        try {
+            upstream.getOutputStream().apply { write(head, 0, len); flush() }
+        } catch (e: IOException) {
+            AccessLog.add(name, "内部サーバーへの送信に失敗しました: ${e.message}")
+            closeQuietly(client)
+            closeQuietly(upstream)
+            return
+        }
+        relay(name, client, upstream, logResponse)
+    }
+
+    private fun connect(targetPort: Int, beforeUse: (Socket) -> Unit = {}): Socket? {
+        if (stopped) return null
+        val socket = Socket()
+        sockets += socket
+        return try {
             socket.connect(InetSocketAddress(InetAddress.getLoopbackAddress(), targetPort), CONNECT_TIMEOUT_MS)
             beforeUse(socket)
+            socket
+        } catch (e: IOException) {
+            closeQuietly(socket)
+            null
         }
-    } catch (e: IOException) {
-        null
     }
 
     /**
@@ -207,8 +236,8 @@ class FrontServer(
                 closeQuietly(upstream)
             }
         }
-        pool.execute {
-            pump(upstream.getInputStream(), client.getOutputStream(), onFirstChunk = { buf, len ->
+        val downstream = Runnable {
+            pump(upstream.getInputStream(), client.getOutputStream(), onChunk = { buf, len ->
                 if (logResponse) statusLine(buf, len)?.let { AccessLog.add(name, "応答: $it") }
             }) { error ->
                 if (error != null && isUnexpected(client, upstream)) {
@@ -218,7 +247,19 @@ class FrontServer(
             }
             finish()
         }
-        pump(client.getInputStream(), upstream.getOutputStream(), onFirstChunk = null) { error ->
+        try {
+            pool.execute(downstream)
+        } catch (e: Exception) {
+            // 停止処理中でスレッドプールが受け付けない
+            closeQuietly(client)
+            closeQuietly(upstream)
+            return
+        }
+        // 同じ接続(keep-alive)で続けて送られたリクエストも記録する。最初の1件は呼び出し元で記録済み
+        val prefix = if (client is SSLSocket) "HTTPS: " else "HTTP: "
+        pump(client.getInputStream(), upstream.getOutputStream(), onChunk = { buf, len ->
+            requestLine(buf, len)?.let { AccessLog.add(name, prefix + it) }
+        }) { error ->
             if (error != null && isUnexpected(client, upstream)) {
                 AccessLog.add(name, "受信中に切断されました: ${error.message}")
             }
@@ -230,20 +271,17 @@ class FrontServer(
     private fun pump(
         input: InputStream,
         output: OutputStream,
-        onFirstChunk: ((ByteArray, Int) -> Unit)?,
+        onChunk: (ByteArray, Int) -> Unit,
         onEnd: (IOException?) -> Unit,
     ) {
         val buffer = ByteArray(BUFFER_SIZE)
-        var first = true
         val error = try {
             while (true) {
                 val n = input.read(buffer)
                 if (n < 0) break
                 if (n == 0) continue
-                if (first) {
-                    first = false
-                    onFirstChunk?.invoke(buffer, n)
-                }
+                // 先頭がリクエスト行/応答行のチャンクだけを記録する(本文の途中は対象外)
+                onChunk(buffer, n)
                 output.write(buffer, 0, n)
                 output.flush()
             }
@@ -280,6 +318,8 @@ class FrontServer(
         private const val FIRST_DATA_TIMEOUT_MS = 60_000
         private const val CONNECT_TIMEOUT_MS = 5_000
         private const val MAX_LOG_LINE = 200
+        private const val MAX_LINE_SCAN = 8 * 1024
+        private const val ACCEPT_RETRY_DELAY_MS = 200L
 
         /** 先頭行が HTTP のリクエスト行(例: "GET / HTTP/1.1")なら返す。 */
         internal fun requestLine(buf: ByteArray, len: Int): String? {
@@ -293,9 +333,10 @@ class FrontServer(
             return line.takeIf { it.startsWith("HTTP/") }?.substringAfter(' ')?.let(::truncate)
         }
 
-        /** 先頭行(改行の手前まで)。表示できない文字を含む場合は null。 */
+        /** 先頭行(改行の手前まで)。改行が無い・表示できない文字を含む場合は null。 */
         private fun firstLine(buf: ByteArray, len: Int): String? {
-            val end = (0 until len).firstOrNull { buf[it] == CR || buf[it] == LF } ?: len
+            val limit = minOf(len, MAX_LINE_SCAN)
+            val end = (0 until limit).firstOrNull { buf[it] == CR || buf[it] == LF } ?: return null
             val text = String(buf, 0, end, Charsets.ISO_8859_1)
             return text.takeIf { s -> s.isNotEmpty() && s.all { it in ' '..'~' } }
         }
