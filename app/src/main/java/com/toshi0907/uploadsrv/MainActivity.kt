@@ -29,7 +29,9 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
@@ -61,6 +63,26 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+        UpdateCheckWorker.schedule(this)
+        // 画面の再生成(回転など)では確認し直さない
+        if (savedInstanceState == null && !handleUpdateIntent(intent)) {
+            UpdateManager.checkAsync(this)
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleUpdateIntent(intent)
+    }
+
+    /** 更新通知のタップで開かれた場合はダウンロードを始める。処理したら true。 */
+    private fun handleUpdateIntent(intent: Intent?): Boolean {
+        if (intent?.action != UpdateManager.ACTION_START_UPDATE) return false
+        // 履歴(最近のアプリ)から再表示されたときに再実行しない
+        if (intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY != 0) return false
+        setIntent(Intent(intent).setAction(Intent.ACTION_MAIN))
+        UpdateManager.startUpdate(this)
+        return true
     }
 }
 
@@ -136,10 +158,82 @@ private fun MainScreen(modifier: Modifier = Modifier) {
 
         BatteryOptimizationCard()
 
-        Text(
-            text = "ビルド番号: ${BuildConfig.VERSION_CODE}",
-            style = MaterialTheme.typography.bodySmall,
-        )
+        UpdateCard()
+    }
+}
+
+@Composable
+private fun UpdateCard() {
+    val context = LocalContext.current
+    val state by UpdateManager.state.collectAsState()
+    var canInstall by remember { mutableStateOf(UpdateManager.canInstallPackages(context)) }
+    // 設定画面で許可して戻ってきたときに反映する
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
+        canInstall = UpdateManager.canInstallPackages(context)
+    }
+
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(text = "アプリの更新", style = MaterialTheme.typography.titleMedium)
+            Text(text = "現在のビルド: #${UpdateManager.currentBuild}")
+
+            when (val s = state) {
+                UpdateState.Idle -> Text(text = "6時間ごとに自動で確認します")
+                UpdateState.Checking -> Text(text = "確認中…")
+                UpdateState.UpToDate -> Text(text = "最新です")
+                is UpdateState.Available -> Text(
+                    text = "新しいビルド #${s.release.buildNumber} があります",
+                    color = MaterialTheme.colorScheme.primary,
+                )
+                is UpdateState.Downloading -> {
+                    val percent = s.progress?.let { " ${(it * 100).toInt()}%" }.orEmpty()
+                    Text(text = "ビルド #${s.release.buildNumber} をダウンロード中…$percent")
+                    val progress = s.progress
+                    if (progress == null) {
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    } else {
+                        LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
+                    }
+                }
+                is UpdateState.ReadyToInstall -> Text(
+                    text = "ビルド #${s.release.buildNumber} のダウンロードが完了しました",
+                    color = MaterialTheme.colorScheme.primary,
+                )
+                is UpdateState.Failed -> Text(text = s.message, color = MaterialTheme.colorScheme.error)
+            }
+
+            val hasUpdate = state is UpdateState.Available || state is UpdateState.ReadyToInstall
+            if (hasUpdate && !canInstall) {
+                Text(
+                    text = "インストールには、このアプリに「不明なアプリのインストール」の許可が必要です",
+                    color = MaterialTheme.colorScheme.error,
+                )
+                OutlinedButton(onClick = { UpdateManager.openInstallPermissionSettings(context) }) {
+                    Text(text = "許可の設定を開く")
+                }
+            }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                when (state) {
+                    is UpdateState.Available -> Button(onClick = { UpdateManager.startUpdate(context) }) {
+                        Text(text = "ダウンロードして更新")
+                    }
+                    is UpdateState.ReadyToInstall -> Button(onClick = { UpdateManager.install(context) }) {
+                        Text(text = "インストール")
+                    }
+                    else -> Unit
+                }
+                OutlinedButton(
+                    onClick = { UpdateManager.checkAsync(context) },
+                    enabled = state !is UpdateState.Checking && state !is UpdateState.Downloading,
+                ) {
+                    Text(text = "今すぐ確認")
+                }
+            }
+        }
     }
 }
 
