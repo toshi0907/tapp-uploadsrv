@@ -75,9 +75,10 @@
 
   function updateSummary() {
     const sent = Math.min(total.bytes, total.doneBytes + total.currentBytes);
+    const failed = total.failed ? `(失敗 ${total.failed}件)` : '';
     summary.textContent = running
-      ? `${total.done} / ${total.files}件 · ${formatBytes(sent)} / ${formatBytes(total.bytes)}`
-      : `完了: ${total.done} / ${total.files}件` + (total.failed ? `(失敗 ${total.failed}件)` : '');
+      ? `${total.done} / ${total.files}件${failed} · ${formatBytes(sent)} / ${formatBytes(total.bytes)}`
+      : `完了: ${total.done} / ${total.files}件${failed}`;
   }
 
   // ファイルごとの表示行(名前・状態・進捗バー)を作る
@@ -117,8 +118,10 @@
     });
   }
 
+  // 結果({ ok, sent })を返す。sent は集計に加える送信量(通信エラー時は途中までの量)
   async function upload(file, item) {
     const started = performance.now();
+    let sentBytes = 0;
     item.status.textContent = '送信中 0%';
     const res = await sendFile(file, ratio => {
       if (ratio === null) {
@@ -128,6 +131,7 @@
       }
       // 進捗はマルチパートの区切りを含む全体に対する割合なので、ファイルサイズに換算して表示する
       const sent = Math.round(file.size * ratio);
+      sentBytes = sent;
       const seconds = (performance.now() - started) / 1000;
       const speed = seconds > 0 ? ` · ${formatBytes(Math.round(sent / seconds))}/s` : '';
       item.bar.value = ratio;
@@ -142,13 +146,13 @@
     });
     if (res === null) {
       finishItem(item, '失敗(通信エラー)', false);
-      return false;
+      return { ok: false, sent: sentBytes };
     }
     const ok = res.status >= 200 && res.status < 300;
     // 成功時・スキップ時(415)はサーバーの結果(実際に保存した名前など)をそのまま表示する
     const skipped = res.status === 415;
     finishItem(item, ok || skipped ? res.text : `失敗(${res.text})`, ok);
-    return ok || skipped;
+    return { ok: ok || skipped, sent: file.size };
   }
 
   // 1ファイルずつ順に送信する(1リクエストあたりのサイズを抑える)
@@ -157,9 +161,10 @@
     while (queue.length) {
       const { file, item } = queue.shift();
       updateSummary();
-      if (!(await upload(file, item))) total.failed++;
+      const result = await upload(file, item);
+      if (!result.ok) total.failed++;
       total.done++;
-      total.doneBytes += file.size;
+      total.doneBytes += result.sent;
       total.currentBytes = 0;
     }
     running = false;
