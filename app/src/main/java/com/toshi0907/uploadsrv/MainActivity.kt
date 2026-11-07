@@ -108,7 +108,8 @@ private fun MainScreen(modifier: Modifier = Modifier) {
     val settings = remember { AppSettings(context) }
     var folder by remember { mutableStateOf(settings.folderState()) }
     var saveMode by remember { mutableStateOf(settings.saveMode) }
-    var albumText by remember { mutableStateOf(settings.albumName) }
+    var savedAlbum by remember { mutableStateOf(settings.albumName) }
+    var albumText by remember { mutableStateOf(savedAlbum) }
 
     // 設定アプリ等で権限が外された場合に備え、画面復帰のたびに再確認する
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
@@ -126,9 +127,9 @@ private fun MainScreen(modifier: Modifier = Modifier) {
         folder = settings.folderState()
     }
 
-    val albumValid = AppSettings.isValidAlbumName(albumText)
+    val albumTextValid = AppSettings.isValidAlbumName(albumText)
     val destinationValid = when (saveMode) {
-        SaveMode.GALLERY -> albumValid
+        SaveMode.GALLERY -> AppSettings.isValidAlbumName(savedAlbum)
         SaveMode.FOLDER -> folder.valid
     }
 
@@ -172,20 +173,17 @@ private fun MainScreen(modifier: Modifier = Modifier) {
                     )
                 }
                 if (saveMode == SaveMode.GALLERY) {
+                    Text(text = "現在のアルバム: Pictures/$savedAlbum")
                     OutlinedTextField(
                         value = albumText,
-                        onValueChange = { text ->
-                            albumText = text
-                            if (AppSettings.isValidAlbumName(text)) settings.albumName = text
-                        },
+                        onValueChange = { text -> albumText = text },
                         label = { Text("アルバム名") },
                         singleLine = true,
-                        isError = !albumValid,
+                        isError = !albumTextValid,
                         supportingText = {
                             Text(
-                                if (albumValid) {
-                                    "Pictures/$albumText に保存し、ギャラリーにアルバムとして表示されます。" +
-                                        "写真・動画以外のファイルは保存しません"
+                                if (albumTextValid) {
+                                    "ギャラリーにアルバムとして表示されます。写真・動画以外のファイルは保存しません"
                                 } else {
                                     "1〜${AppSettings.MAX_ALBUM_NAME_LENGTH}文字で入力してください" +
                                         "(前後の空白、先頭の「.」、記号 / \\ : * ? \" < > | は使えません)"
@@ -194,6 +192,16 @@ private fun MainScreen(modifier: Modifier = Modifier) {
                         },
                         modifier = Modifier.fillMaxWidth(),
                     )
+                    // 入力途中の名前でアルバムが作られないよう、確定ボタンで反映する
+                    Button(
+                        onClick = {
+                            settings.albumName = albumText
+                            savedAlbum = settings.albumName
+                        },
+                        enabled = albumTextValid && albumText != savedAlbum,
+                    ) {
+                        Text(text = "アルバム名を変更")
+                    }
                 }
 
                 SaveModeOption(

@@ -5,16 +5,20 @@ import android.content.ContentValues
 import android.content.Context
 import android.net.Uri
 import android.os.Build
+import android.os.Bundle
 import android.os.Environment
+import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.webkit.MimeTypeMap
 import androidx.annotation.RequiresApi
-import androidx.documentfile.provider.DocumentFile
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.IOException
 import java.io.OutputStream
+import kotlin.coroutines.cancellation.CancellationException
 
 /** 保存できない種類のファイル(ギャラリー方式での写真・動画以外)。 */
 class UnsupportedFileException(message: String) : IOException(message)
@@ -27,21 +31,36 @@ interface UploadStorage {
     suspend fun save(name: String, write: suspend (OutputStream) -> Unit): String
 
     companion object {
+        /**
+         * 名前の決定から保存先の項目作成までを直列化する。同時に同名のアップロードが来ても、
+         * 先に作られた(空の)項目が一覧に見えるため、アプリ側で重複しない名前を決められる。
+         */
+        internal val nameLock = Mutex()
+
         /** 現在の設定に応じた保存先を返す。保存できない状態なら [IOException]。 */
-        fun from(context: Context, settings: AppSettings): UploadStorage = when (settings.saveMode) {
-            SaveMode.GALLERY -> {
-                // isGallerySupported() と同じ条件。lint が API レベルの確認を認識できるよう直接比較する
-                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) throw IOException("この端末ではギャラリーに保存できません")
-                val album = settings.albumName
-                if (!AppSettings.isValidAlbumName(album)) throw IOException("アルバム名が不正です")
-                GalleryStorage(context.applicationContext, album)
+        fun from(context: Context, settings: AppSettings): UploadStorage {
+            // サーバー起動の可否と同じ判定を使い、起動できるのに保存できない、というずれを防ぐ
+            if (!settings.hasValidDestination()) {
+                throw IOException(
+                    when (settings.saveMode) {
+                        SaveMode.GALLERY -> "アルバム名が不正です"
+                        SaveMode.FOLDER -> "保存先フォルダが未設定、またはアクセス権限がありません"
+                    },
+                )
             }
-            SaveMode.FOLDER -> {
-                if (!settings.hasValidSaveFolder()) {
-                    throw IOException("保存先フォルダが未設定、またはアクセス権限がありません")
+            val appContext = context.applicationContext
+            return when (settings.saveMode) {
+                SaveMode.GALLERY -> {
+                    // saveMode が GALLERY を返すのは Android 10 以上のみ。lint 向けに API レベルを直接確認する
+                    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                        throw IOException("この端末ではギャラリーに保存できません")
+                    }
+                    GalleryStorage(appContext, settings.albumName)
                 }
-                val folder = settings.saveFolder() ?: throw IOException("保存先フォルダを開けません")
-                FolderStorage(context.applicationContext, folder)
+                SaveMode.FOLDER -> {
+                    val uri = settings.saveFolderUri ?: throw IOException("保存先フォルダを開けません")
+                    FolderStorage(appContext, uri)
+                }
             }
         }
 
@@ -66,25 +85,48 @@ interface UploadStorage {
     }
 }
 
-/** SAFで選んだフォルダに保存する。 */
-private class FolderStorage(private val context: Context, private val folder: DocumentFile) : UploadStorage {
+/** SAFで選んだフォルダ([treeUri])に保存する。 */
+private class FolderStorage(private val context: Context, private val treeUri: Uri) : UploadStorage {
     override suspend fun save(name: String, write: suspend (OutputStream) -> Unit): String {
-        val file = withContext(Dispatchers.IO) {
-            val taken = resolverCall { folder.listFiles().mapNotNullTo(HashSet()) { it.name } }
-            val target = UploadStorage.uniqueName(name, taken)
-            // MIMEを octet-stream にして、プロバイダに拡張子を付け替えられないようにする。
-            // 同時に同名が作られた場合でもプロバイダが別名を付けるため、実際の名前は作成結果から取る
-            val created = resolverCall { folder.createFile("application/octet-stream", target) }
-            created ?: throw IOException("ファイルを作成できません: $name")
+        val resolver = context.contentResolver
+        val parent = DocumentsContract.buildDocumentUriUsingTree(treeUri, DocumentsContract.getTreeDocumentId(treeUri))
+        val file = UploadStorage.nameLock.withLock {
+            withContext(Dispatchers.IO) {
+                val target = UploadStorage.uniqueName(name, resolverCall { childNames(resolver) })
+                // MIMEを octet-stream にして、プロバイダに拡張子を付け替えられないようにする
+                val created = resolverCall {
+                    DocumentsContract.createDocument(resolver, parent, "application/octet-stream", target)
+                }
+                created ?: throw IOException("ファイルを作成できません: $name")
+            }
         }
         try {
-            writeTo(context.contentResolver, file.uri, name, write)
+            writeTo(resolver, file, name, write)
         } catch (e: Throwable) {
             // 書きかけのファイルを残さない
-            withContext(NonCancellable + Dispatchers.IO) { runCatching { file.delete() } }
+            withContext(NonCancellable + Dispatchers.IO) {
+                runCatching { DocumentsContract.deleteDocument(resolver, file) }
+            }
             throw e
         }
-        return withContext(Dispatchers.IO) { file.name } ?: name
+        return withContext(Dispatchers.IO) { displayName(resolver, file, DocumentsContract.Document.COLUMN_DISPLAY_NAME) }
+            ?: name
+    }
+
+    /** フォルダ直下の名前の一覧(ファイル・フォルダとも)。1回の問い合わせで取得する。 */
+    private fun childNames(resolver: ContentResolver): Set<String> {
+        val children = DocumentsContract.buildChildDocumentsUriUsingTree(
+            treeUri,
+            DocumentsContract.getTreeDocumentId(treeUri),
+        )
+        val names = HashSet<String>()
+        resolver.query(children, arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null)
+            ?.use { cursor ->
+                while (cursor.moveToNext()) {
+                    cursor.getString(0)?.let(names::add)
+                }
+            } ?: throw IOException("保存先フォルダの内容を取得できません")
+        return names
     }
 }
 
@@ -106,57 +148,64 @@ private class GalleryStorage(private val context: Context, album: String) : Uplo
         } ?: throw UnsupportedFileException("写真・動画以外のため保存しませんでした")
 
         val resolver = context.contentResolver
-        val item = withContext(Dispatchers.IO) {
-            // 権限なしで見えるのはこのアプリが保存したファイルだけ。他のアプリのファイルと重なった場合は
-            // MediaStore が別名を付けるため、実際の名前は保存後に読み直す
-            val target = UploadStorage.uniqueName(name, resolverCall { existingNames(resolver) })
-            val values = ContentValues().apply {
-                put(MediaStore.MediaColumns.DISPLAY_NAME, target)
-                put(MediaStore.MediaColumns.MIME_TYPE, mime)
-                put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath)
-                // 書き込み中はギャラリーに出さない
-                put(MediaStore.MediaColumns.IS_PENDING, 1)
+        val item = UploadStorage.nameLock.withLock {
+            withContext(Dispatchers.IO) {
+                // 権限なしで見えるのはこのアプリが保存したファイルだけ。他のアプリのファイルと重なった場合は
+                // MediaStore が別名を付けるため、実際の名前は保存後に読み直す
+                val target = UploadStorage.uniqueName(name, resolverCall { existingNames(resolver) })
+                val values = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, target)
+                    put(MediaStore.MediaColumns.MIME_TYPE, mime)
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath)
+                    // 書き込み中はギャラリーに出さない
+                    put(MediaStore.MediaColumns.IS_PENDING, 1)
+                }
+                val inserted = resolverCall { resolver.insert(collection, values) }
+                inserted ?: throw IOException("ギャラリーに登録できません: $name")
             }
-            val inserted = resolverCall { resolver.insert(collection, values) }
-            inserted ?: throw IOException("ギャラリーに登録できません: $name")
         }
         try {
             writeTo(resolver, item, name, write)
             withContext(Dispatchers.IO) {
                 val published = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
-                resolverCall { resolver.update(item, published, null, null) }
+                val updated = resolverCall { resolver.update(item, published, null, null) }
+                // 公開できないとギャラリーに出ず、保留のまま後で自動削除されるため失敗として扱う
+                if (updated == 0) throw IOException("ギャラリーに公開できません: $name")
             }
         } catch (e: Throwable) {
             // 書きかけの項目を残さない
             withContext(NonCancellable + Dispatchers.IO) { runCatching { resolver.delete(item, null, null) } }
             throw e
         }
-        return withContext(Dispatchers.IO) { displayName(resolver, item) } ?: name
+        return withContext(Dispatchers.IO) { displayName(resolver, item, MediaStore.MediaColumns.DISPLAY_NAME) }
+            ?: name
     }
 
-    /** このアルバム内で(このアプリから見える)既存のファイル名。 */
+    /** このアルバム内で(このアプリから見える)既存のファイル名。書き込み中・ゴミ箱の項目も含める。 */
     private fun existingNames(resolver: ContentResolver): Set<String> {
-        val names = HashSet<String>()
-        resolver.query(
-            MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
-            arrayOf(MediaStore.MediaColumns.DISPLAY_NAME),
-            "${MediaStore.MediaColumns.RELATIVE_PATH} = ?",
-            arrayOf(relativePath),
-            null,
-        )?.use { cursor ->
-            while (cursor.moveToNext()) {
-                cursor.getString(0)?.let(names::add)
+        val files = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        val projection = arrayOf(MediaStore.MediaColumns.DISPLAY_NAME)
+        val selection = "${MediaStore.MediaColumns.RELATIVE_PATH} = ?"
+        val args = arrayOf(relativePath)
+        val cursor = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val query = Bundle().apply {
+                putString(ContentResolver.QUERY_ARG_SQL_SELECTION, selection)
+                putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, args)
+                putInt(MediaStore.QUERY_ARG_MATCH_PENDING, MediaStore.MATCH_INCLUDE)
+                putInt(MediaStore.QUERY_ARG_MATCH_TRASHED, MediaStore.MATCH_INCLUDE)
             }
+            resolver.query(files, projection, query, null)
+        } else {
+            resolver.query(files, projection, selection, args, null)
         }
+        val names = HashSet<String>()
+        cursor?.use {
+            while (it.moveToNext()) {
+                it.getString(0)?.let(names::add)
+            }
+        } ?: throw IOException("ギャラリーの内容を取得できません")
         return names
     }
-
-    private fun displayName(resolver: ContentResolver, item: Uri): String? =
-        runCatching {
-            resolver.query(item, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
-                if (cursor.moveToFirst()) cursor.getString(0) else null
-            }
-        }.getOrNull()
 
     private fun mimeTypeOf(name: String): String? {
         val ext = name.substringAfterLast('.', "").lowercase()
@@ -164,6 +213,14 @@ private class GalleryStorage(private val context: Context, album: String) : Uplo
         return MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
     }
 }
+
+/** [uri] の表示名を読み直す。取得できなければ null。 */
+private fun displayName(resolver: ContentResolver, uri: Uri, column: String): String? =
+    runCatching {
+        resolver.query(uri, arrayOf(column), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) cursor.getString(0) else null
+        }
+    }.getOrNull()
 
 /** [uri] を新規に開いて書き込む。受信データは都度書き込み、メモリに全量を載せない。 */
 private suspend fun writeTo(
@@ -178,16 +235,14 @@ private suspend fun writeTo(
 }
 
 /**
- * ContentResolver / DocumentFile の呼び出しで投げられる実行時例外(権限の取り消し等)を [IOException] に変換する。
- * 呼び出し側は [IOException] だけを扱えばよい。
+ * ContentResolver / DocumentsProvider の呼び出しで投げられる実行時例外(権限の取り消し、プロバイダ内部の失敗等)を
+ * [IOException] に変換する。呼び出し側は [IOException] だけを扱えばよい。コルーチンのキャンセルはそのまま伝える。
  */
 private inline fun <T> resolverCall(block: () -> T): T =
     try {
         block()
-    } catch (e: SecurityException) {
-        throw IOException("保存先にアクセスできません: ${e.message}", e)
-    } catch (e: IllegalArgumentException) {
-        throw IOException("保存先にアクセスできません: ${e.message}", e)
-    } catch (e: UnsupportedOperationException) {
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: RuntimeException) {
         throw IOException("保存先にアクセスできません: ${e.message}", e)
     }

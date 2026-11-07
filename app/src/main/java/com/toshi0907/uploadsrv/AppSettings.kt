@@ -97,7 +97,8 @@ class AppSettings(context: Context) {
     companion object {
         const val DEFAULT_PORT = 8080
         const val DEFAULT_ALBUM_NAME = "アップロード"
-        const val MAX_ALBUM_NAME_LENGTH = 100
+        /** アルバム名の最大文字数。フォルダ名の上限(UTF-8で255バイト)に収まるよう、全角でも余裕を持たせる。 */
+        const val MAX_ALBUM_NAME_LENGTH = 50
         private const val PREFS_NAME = "settings"
         private const val KEY_SAVE_FOLDER_URI = "save_folder_uri"
         private const val KEY_PORT = "port"
