@@ -12,7 +12,7 @@
   #drop.over { border-color: #1565c0; background: #e3f2fd; }
   button { margin-top: 12px; padding: 10px 20px; font-size: 1rem; }
   ul { list-style: none; padding: 0; }
-  li { background: #fff; margin: 6px 0; padding: 8px 12px; border-radius: 8px; word-break: break-all; }
+  li { background: #fff; margin: 6px 0; padding: 8px 12px; border-radius: 8px; word-break: break-all; white-space: pre-line; }
   .ok { color: #2e7d32; }
   .ng { color: #c62828; }
 </style>
@@ -69,7 +69,9 @@
       try {
         const res = await fetch('/upload', { method: 'POST', body: form });
         const text = await res.text();
-        addResult(res.ok ? `完了: ${file.name}` : `失敗: ${file.name}(${text})`, res.ok);
+        // 成功時・スキップ時(415)はサーバーの結果(実際に保存した名前など)をそのまま表示する
+        const message = res.ok || res.status === 415 ? text : `失敗: ${file.name}(${text})`;
+        addResult(message, res.ok);
       } catch (e) {
         addResult(`失敗: ${file.name}(通信エラー)`, false);
       }

@@ -7,7 +7,7 @@ import android.util.Log
 
 /**
  * 端末起動時にサーバーを自動起動する。
- * サーバーON設定かつ保存先フォルダの権限が有効な場合のみ起動する。
+ * サーバーON設定かつ保存先が有効(ギャラリー方式、または保存先フォルダの権限が有効)な場合のみ起動する。
  *
  * Android 14 以降は BOOT_COMPLETED から起動できるFGS種別に制限があるが
  * (dataSync・camera・mediaPlayback 等は不可)、本アプリの specialUse は対象外。
@@ -16,7 +16,7 @@ class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
         val settings = AppSettings(context)
-        if (!settings.serverEnabled || !settings.hasValidSaveFolder()) return
+        if (!settings.serverEnabled || !settings.hasValidDestination()) return
         try {
             UploadService.start(context)
         } catch (e: IllegalStateException) {
