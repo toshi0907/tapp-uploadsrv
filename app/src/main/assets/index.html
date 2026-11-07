@@ -19,6 +19,8 @@
   #summary:empty { display: none; }
   .name { font-weight: bold; }
   .status { font-size: 0.9rem; color: #555; }
+  .status.ok { color: #2e7d32; }
+  .status.ng { color: #c62828; }
   progress { display: block; width: 100%; height: 8px; margin-top: 4px; }
 </style>
 </head>
@@ -61,13 +63,13 @@
   // 送信待ちを含む一連のアップロード全体の集計(キューが空になったら次回リセット)
   const queue = [];
   let running = false;
-  let total = { files: 0, bytes: 0, done: 0, doneBytes: 0, currentBytes: 0 };
+  let total = { files: 0, bytes: 0, done: 0, failed: 0, doneBytes: 0, currentBytes: 0 };
 
   function formatBytes(n) {
     if (n < 1024) return `${n} B`;
     const units = ['KB', 'MB', 'GB'];
     let v = n / 1024, i = 0;
-    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    while (v >= 1023.95 && i < units.length - 1) { v /= 1024; i++; }
     return `${v.toFixed(1)} ${units[i]}`;
   }
 
@@ -75,7 +77,7 @@
     const sent = Math.min(total.bytes, total.doneBytes + total.currentBytes);
     summary.textContent = running
       ? `${total.done} / ${total.files}件 · ${formatBytes(sent)} / ${formatBytes(total.bytes)}`
-      : `完了: ${total.done} / ${total.files}件`;
+      : `完了: ${total.done} / ${total.files}件` + (total.failed ? `(失敗 ${total.failed}件)` : '');
   }
 
   // ファイルごとの表示行(名前・状態・進捗バー)を作る
@@ -108,7 +110,7 @@
       xhr.upload.onprogress = e => onProgress(e.lengthComputable ? e.loaded / e.total : null);
       xhr.upload.onload = onSent;
       xhr.onload = () => resolve({ status: xhr.status, text: xhr.responseText });
-      xhr.onerror = () => resolve(null);
+      xhr.onerror = xhr.onabort = xhr.ontimeout = () => resolve(null);
       const form = new FormData();
       form.append('file', file, file.name);
       xhr.send(form);
@@ -140,11 +142,13 @@
     });
     if (res === null) {
       finishItem(item, '失敗(通信エラー)', false);
-    } else {
-      const ok = res.status >= 200 && res.status < 300;
-      // 成功時・スキップ時(415)はサーバーの結果(実際に保存した名前など)をそのまま表示する
-      finishItem(item, ok || res.status === 415 ? res.text : `失敗(${res.text})`, ok);
+      return false;
     }
+    const ok = res.status >= 200 && res.status < 300;
+    // 成功時・スキップ時(415)はサーバーの結果(実際に保存した名前など)をそのまま表示する
+    const skipped = res.status === 415;
+    finishItem(item, ok || skipped ? res.text : `失敗(${res.text})`, ok);
+    return ok || skipped;
   }
 
   // 1ファイルずつ順に送信する(1リクエストあたりのサイズを抑える)
@@ -152,9 +156,8 @@
     running = true;
     while (queue.length) {
       const { file, item } = queue.shift();
-      total.currentBytes = 0;
       updateSummary();
-      await upload(file, item);
+      if (!(await upload(file, item))) total.failed++;
       total.done++;
       total.doneBytes += file.size;
       total.currentBytes = 0;
@@ -167,7 +170,7 @@
     const files = pending;
     setFiles([]);
     input.value = '';
-    if (!running) total = { files: 0, bytes: 0, done: 0, doneBytes: 0, currentBytes: 0 };
+    if (!running) total = { files: 0, bytes: 0, done: 0, failed: 0, doneBytes: 0, currentBytes: 0 };
     // 選んだ順に上から並べる(新しい選択ほど上に表示する)
     const fragment = document.createDocumentFragment();
     for (const file of files) {
