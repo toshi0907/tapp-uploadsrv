@@ -15,6 +15,13 @@
   li { background: #fff; margin: 6px 0; padding: 8px 12px; border-radius: 8px; word-break: break-all; white-space: pre-line; }
   .ok { color: #2e7d32; }
   .ng { color: #c62828; }
+  #summary { margin: 16px 0 0; font-weight: bold; }
+  #summary:empty { display: none; }
+  .name { font-weight: bold; }
+  .status { font-size: 0.9rem; color: #555; }
+  .status.ok { color: #2e7d32; }
+  .status.ng { color: #c62828; }
+  progress { display: block; width: 100%; height: 8px; margin-top: 4px; }
 </style>
 </head>
 <body>
@@ -26,6 +33,7 @@
     <br>
     <button id="send" disabled>アップロード</button>
   </div>
+  <p id="summary"></p>
   <ul id="results"></ul>
 </main>
 <script>
@@ -50,32 +58,135 @@
   }));
   drop.addEventListener('drop', e => setFiles(e.dataTransfer.files));
 
-  function addResult(text, ok) {
+  const summary = document.getElementById('summary');
+
+  // 送信待ちを含む一連のアップロード全体の集計(キューが空になったら次回リセット)
+  const queue = [];
+  let running = false;
+  let total = { files: 0, bytes: 0, done: 0, failed: 0, doneBytes: 0, currentBytes: 0 };
+
+  function formatBytes(n) {
+    if (n < 1024) return `${n} B`;
+    const units = ['KB', 'MB', 'GB'];
+    let v = n / 1024, i = 0;
+    while (v >= 1023.95 && i < units.length - 1) { v /= 1024; i++; }
+    return `${v.toFixed(1)} ${units[i]}`;
+  }
+
+  function updateSummary() {
+    const sent = Math.min(total.bytes, total.doneBytes + total.currentBytes);
+    const failed = total.failed ? `(失敗 ${total.failed}件)` : '';
+    summary.textContent = running
+      ? `${total.done} / ${total.files}件${failed} · ${formatBytes(sent)} / ${formatBytes(total.bytes)}`
+      : `完了: ${total.done} / ${total.files}件${failed}`;
+  }
+
+  // ファイルごとの表示行(名前・状態・進捗バー)を作る
+  function createItem(file) {
     const li = document.createElement('li');
-    li.textContent = text;
-    li.className = ok ? 'ok' : 'ng';
-    results.prepend(li);
+    const name = document.createElement('div');
+    name.className = 'name';
+    name.textContent = file.name;
+    const status = document.createElement('div');
+    status.className = 'status';
+    status.textContent = `待機中(${formatBytes(file.size)})`;
+    const bar = document.createElement('progress');
+    bar.max = 1;
+    bar.value = 0;
+    li.append(name, status, bar);
+    return { li, status, bar };
+  }
+
+  function finishItem(item, text, ok) {
+    item.bar.remove();
+    item.status.textContent = text;
+    item.status.className = 'status ' + (ok ? 'ok' : 'ng');
+  }
+
+  // fetch では送信の進捗を取れないため XMLHttpRequest で送る
+  function sendFile(file, onProgress, onSent) {
+    return new Promise(resolve => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/upload');
+      xhr.upload.onprogress = e => onProgress(e.lengthComputable ? e.loaded / e.total : null);
+      xhr.upload.onload = onSent;
+      xhr.onload = () => resolve({ status: xhr.status, text: xhr.responseText });
+      xhr.onerror = xhr.onabort = xhr.ontimeout = () => resolve(null);
+      const form = new FormData();
+      form.append('file', file, file.name);
+      xhr.send(form);
+    });
+  }
+
+  // 結果({ ok, sent })を返す。sent は集計に加える送信量(通信エラー時は途中までの量)
+  async function upload(file, item) {
+    const started = performance.now();
+    let sentBytes = 0;
+    item.status.textContent = '送信中 0%';
+    const res = await sendFile(file, ratio => {
+      if (ratio === null) {
+        item.bar.removeAttribute('value');
+        item.status.textContent = '送信中';
+        return;
+      }
+      // 進捗はマルチパートの区切りを含む全体に対する割合なので、ファイルサイズに換算して表示する
+      const sent = Math.round(file.size * ratio);
+      sentBytes = sent;
+      const seconds = (performance.now() - started) / 1000;
+      const speed = seconds > 0 ? ` · ${formatBytes(Math.round(sent / seconds))}/s` : '';
+      item.bar.value = ratio;
+      item.status.textContent =
+        `送信中 ${Math.floor(ratio * 100)}%(${formatBytes(sent)} / ${formatBytes(file.size)})${speed}`;
+      total.currentBytes = sent;
+      updateSummary();
+    }, () => {
+      // 送信し終えてからサーバーの応答(保存完了)までの間
+      item.bar.removeAttribute('value');
+      item.status.textContent = '保存処理中…';
+    });
+    if (res === null) {
+      finishItem(item, '失敗(通信エラー)', false);
+      return { ok: false, sent: sentBytes };
+    }
+    const ok = res.status >= 200 && res.status < 300;
+    // 成功時・スキップ時(415)はサーバーの結果(実際に保存した名前など)をそのまま表示する
+    const skipped = res.status === 415;
+    finishItem(item, ok || skipped ? res.text : `失敗(${res.text})`, ok);
+    return { ok: ok || skipped, sent: file.size };
   }
 
   // 1ファイルずつ順に送信する(1リクエストあたりのサイズを抑える)
-  send.addEventListener('click', async () => {
+  async function runQueue() {
+    running = true;
+    while (queue.length) {
+      const { file, item } = queue.shift();
+      updateSummary();
+      const result = await upload(file, item);
+      if (!result.ok) total.failed++;
+      total.done++;
+      total.doneBytes += result.sent;
+      total.currentBytes = 0;
+    }
+    running = false;
+    updateSummary();
+  }
+
+  send.addEventListener('click', () => {
     const files = pending;
     setFiles([]);
     input.value = '';
-    send.disabled = true;
+    if (!running) total = { files: 0, bytes: 0, done: 0, failed: 0, doneBytes: 0, currentBytes: 0 };
+    // 選んだ順に上から並べる(新しい選択ほど上に表示する)
+    const fragment = document.createDocumentFragment();
     for (const file of files) {
-      const form = new FormData();
-      form.append('file', file, file.name);
-      try {
-        const res = await fetch('/upload', { method: 'POST', body: form });
-        const text = await res.text();
-        // 成功時・スキップ時(415)はサーバーの結果(実際に保存した名前など)をそのまま表示する
-        const message = res.ok || res.status === 415 ? text : `失敗: ${file.name}(${text})`;
-        addResult(message, res.ok);
-      } catch (e) {
-        addResult(`失敗: ${file.name}(通信エラー)`, false);
-      }
+      const item = createItem(file);
+      fragment.append(item.li);
+      queue.push({ file, item });
+      total.files++;
+      total.bytes += file.size;
     }
+    results.prepend(fragment);
+    if (running) updateSummary(); else runQueue();
   });
 </script>
 </body>
