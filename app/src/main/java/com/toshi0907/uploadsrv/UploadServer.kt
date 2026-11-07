@@ -19,6 +19,7 @@ import io.ktor.server.routing.routing
 import io.ktor.utils.io.jvm.javaio.copyTo
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.io.IOException
 import java.io.OutputStream
 
@@ -26,6 +27,9 @@ import java.io.OutputStream
  * アップロード用HTTPサーバー(Ktor/CIO)。
  * - GET  /        アップロード画面(assets/index.html)
  * - POST /upload  multipart/form-data を受信し、保存先フォルダへストリーミングで書き込む
+ *
+ * Ktor はループバックの空きポートでだけ待ち受け、公開ポートは [FrontServer] が受けて中継する
+ * (同じポートで HTTP と HTTPS を受け付け、接続ログを取るため)。
  */
 class UploadServer(context: Context, private val port: Int) {
     private val appContext = context.applicationContext
@@ -34,10 +38,23 @@ class UploadServer(context: Context, private val port: Int) {
         appContext.assets.open("index.html").bufferedReader(Charsets.UTF_8).use { it.readText() }
     }
     private var server: EmbeddedServer<*, *>? = null
+    private var front: FrontServer? = null
 
-    /** サーバーを起動する。ポート使用中などで失敗した場合は例外を投げる。 */
-    fun start() {
-        val engine = embeddedServer(CIO, port = port, host = "0.0.0.0") {
+    /** HTTPS でも接続できるか([start] 後に有効)。 */
+    val httpsAvailable: Boolean get() = front?.httpsAvailable == true
+
+    /** サーバーを起動する。ポート使用中などで失敗した場合は例外を投げる(後始末は [stop])。 */
+    suspend fun start() {
+        // HTTPS を準備できなくても HTTP だけで動かす
+        val ssl = runCatching { TlsIdentity.sslContext(File(appContext.filesDir, "tls"), NetworkUtils.localIpv4Addresses()) }
+            .onFailure { AccessLog.add("-", "HTTPSの証明書を準備できませんでした: ${it.message}") }
+            .getOrNull()
+        // 公開ポートを先に確保する(Ktorの空きポート割り当てに同じ番号を取られないように)
+        val publicServer = FrontServer(port, ssl)
+        front = publicServer
+        publicServer.bind()
+
+        val engine = embeddedServer(CIO, port = 0, host = LOOPBACK) {
             routing {
                 get("/") {
                     call.respondText(indexHtml, ContentType.Text.Html.withCharset(Charsets.UTF_8))
@@ -49,9 +66,13 @@ class UploadServer(context: Context, private val port: Int) {
         }
         engine.start(wait = false)
         server = engine
+        val backendPort = engine.engine.resolvedConnectors().first().port
+        publicServer.start(backendPort)
     }
 
     fun stop() {
+        front?.stop()
+        front = null
         server?.stop(gracePeriodMillis = 500, timeoutMillis = 2_000)
         server = null
     }
@@ -119,6 +140,8 @@ class UploadServer(context: Context, private val port: Int) {
     }
 
     companion object {
+        private const val LOOPBACK = "127.0.0.1"
+
         /** パス区切りや制御文字を除いたファイル名を返す。使えない名前なら null。 */
         fun sanitizeFileName(original: String?): String? {
             val base = original

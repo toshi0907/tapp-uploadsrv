@@ -12,6 +12,7 @@ Android端末上でHTTPサーバーを常駐させ、同一Wi-Fi内のブラウ�
 ## 構成(`app/src/main/java/com/toshi0907/uploadsrv/`)
 
 - `UploadServer`: Ktor(CIO)。`GET /` で `assets/index.html`、`POST /upload` でmultipartを保存先へストリーミング書き込み
+- `FrontServer`: 公開ポートで受け、先頭バイトでHTTP/TLSを判別してループバックのKtorへ中継(CIOはTLS非対応)。経過は `AccessLog` に記録。証明書は `TlsIdentity` が自己署名で生成
 - `MainActivity`(Compose UI)→ `UploadService`(フォアグラウンドサービス)→ `ServerController`(起動/停止をMutexで直列化、状態をStateFlowで公開)→ `UploadServer`
 - `AppSettings`: SharedPreferences。保存先はSAFのツリーURI(`DocumentFile` 経由で書き込む)
 - `UpdateManager` / `UpdateCheckWorker`: GitHub Releases `latest` を確認してAPKを更新(WorkManagerで定期実行)

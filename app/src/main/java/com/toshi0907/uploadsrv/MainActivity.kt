@@ -51,6 +51,9 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -155,6 +158,8 @@ private fun MainScreen(modifier: Modifier = Modifier) {
         }
 
         ServerCard(settings = settings, folderValid = folder.valid)
+
+        AccessLogCard()
 
         BatteryOptimizationCard()
 
@@ -325,12 +330,66 @@ private fun ServerCard(settings: AppSettings, folderValid: Boolean) {
                             text = urls.first(),
                             modifier = Modifier.align(Alignment.CenterHorizontally),
                         )
+                        if (s.https) {
+                            Text(text = "HTTPSでも接続できます(自己署名証明書のため、ブラウザに警告が表示されます)")
+                            SelectionContainer {
+                                Text(
+                                    text = addresses.joinToString("\n") { ip -> "https://$ip:${s.port}" },
+                                    color = MaterialTheme.colorScheme.primary,
+                                )
+                            }
+                        }
+                        val alternatives = if (s.https) "別のブラウザ(Brave等)や https:// のURL" else "別のブラウザ(Brave等)"
+                        Text(
+                            text = "開けない場合は、${alternatives}を試してください。" +
+                                "下の「接続ログ」で、通信が届いているかを確認できます",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
                     }
                 }
                 is ServerState.Failed -> Text(text = s.message, color = MaterialTheme.colorScheme.error)
                 ServerState.Stopped -> Text(
                     text = if (folderValid) "停止中" else "保存先フォルダを選択すると起動できます",
                 )
+            }
+        }
+    }
+}
+
+/** 接続ログ(診断用)。新しい順に表示する。 */
+@Composable
+private fun AccessLogCard() {
+    val entries by AccessLog.entries.collectAsState()
+    val timeFormat = remember { SimpleDateFormat("HH:mm:ss", Locale.JAPAN) }
+
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "接続ログ",
+                    style = MaterialTheme.typography.titleMedium,
+                    modifier = Modifier.weight(1f),
+                )
+                OutlinedButton(onClick = AccessLog::clear, enabled = entries.isNotEmpty()) {
+                    Text(text = "クリア")
+                }
+            }
+            if (entries.isEmpty()) {
+                Text(text = "まだ接続はありません。別の端末からアクセスすると、ここに記録されます")
+            } else {
+                SelectionContainer {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        entries.forEach { entry ->
+                            Text(
+                                text = "${timeFormat.format(Date(entry.time))} ${entry.client}\n${entry.message}",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                    }
+                }
             }
         }
     }

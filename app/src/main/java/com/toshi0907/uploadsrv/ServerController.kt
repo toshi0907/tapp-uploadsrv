@@ -4,6 +4,7 @@ import android.content.Context
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -16,7 +17,8 @@ import kotlinx.coroutines.withContext
 /** サーバーの稼働状態。 */
 sealed interface ServerState {
     data object Stopped : ServerState
-    data class Running(val port: Int) : ServerState
+    /** [https] は同じポートで HTTPS も受け付けられるか。 */
+    data class Running(val port: Int, val https: Boolean) : ServerState
     data class Failed(val message: String) : ServerState
 }
 
@@ -40,9 +42,12 @@ object ServerController {
         try {
             withContext(Dispatchers.IO) { newServer.start() }
             server = newServer
-            _state.value = ServerState.Running(port)
+            _state.value = ServerState.Running(port, newServer.httpsAvailable)
             newServer
         } catch (e: CancellationException) {
+            // 起動途中で取り消されても、ポートを掴んだままにしない
+            withContext(NonCancellable + Dispatchers.IO) { runCatching { newServer.stop() } }
+            _state.value = ServerState.Stopped
             throw e
         } catch (e: Exception) {
             withContext(Dispatchers.IO) { runCatching { newServer.stop() } }

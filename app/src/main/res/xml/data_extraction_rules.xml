@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android 12 以降のバックアップ/端末間転送の対象設定。
+  allowBackup="false" でも端末間転送は行われるため、HTTPS用の秘密鍵(files/tls)は明示的に除外する。
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="file" path="tls/" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="file" path="tls/" />
+    </device-transfer>
+</data-extraction-rules>
