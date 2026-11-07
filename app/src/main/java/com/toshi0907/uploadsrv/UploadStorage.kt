@@ -72,8 +72,13 @@ interface UploadStorage {
             val lower = taken.mapTo(HashSet()) { it.lowercase() }
             if (name.lowercase() !in lower) return name
             val dot = name.lastIndexOf('.')
-            // 先頭のドットだけの名前(.hidden 等)は拡張子とみなさない
-            val (base, ext) = if (dot > 0) name.substring(0, dot) to name.substring(dot) else name to ""
+            // 先頭のドットだけの名前(.hidden 等)や、異常に長い「拡張子」は拡張子とみなさない
+            // (拡張子だけで上限を使い切り、番号を付けると255バイトを超えるのを防ぐ)
+            val (base, ext) = if (dot > 0 && utf8Length(name.substring(dot)) <= MAX_EXT_BYTES) {
+                name.substring(0, dot) to name.substring(dot)
+            } else {
+                name to ""
+            }
             for (i in 1..MAX_SUFFIX) {
                 val suffix = " ($i)$ext"
                 // 番号を付けてもファイル名の上限(UTF-8で255バイト)に収まるよう、元の名前の側を短くする
@@ -101,6 +106,9 @@ interface UploadStorage {
         private fun utf8Length(text: String): Int = text.toByteArray(Charsets.UTF_8).size
 
         private const val MAX_SUFFIX = 9999
+
+        /** 拡張子として扱う最大バイト数(ドットを含む)。これを超える部分は名前の一部として切り詰め対象にする。 */
+        private const val MAX_EXT_BYTES = 32
 
         /** 一般的なファイルシステムのファイル名の上限(バイト)。 */
         private const val MAX_NAME_BYTES = 255
