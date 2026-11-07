@@ -96,6 +96,8 @@ class UploadServer(context: Context, private val port: Int) {
         val storage = try {
             UploadStorage.from(appContext, settings)
         } catch (e: IOException) {
+            // 本文を読まずに応答して接続を閉じると、ブラウザが応答を受け取れず通信エラーになることがあるため読み捨てる
+            call.receiveChannel().discard()
             return UploadReply(HttpStatusCode.ServiceUnavailable, e.message ?: "保存先を準備できません")
         }
         val saved = mutableListOf<String>()
