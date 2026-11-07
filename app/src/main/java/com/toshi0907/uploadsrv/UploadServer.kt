@@ -93,7 +93,11 @@ class UploadServer(context: Context, private val port: Int) {
                         if (name != null) {
                             try {
                                 val actual = storage.save(name) { output -> part.provider().copyTo(output) }
-                                saved += if (actual == name) "保存: $name" else "保存: $name → $actual"
+                                saved += when (actual) {
+                                    name -> "保存: $name"
+                                    null -> "保存: $name(保存名を確認できません)"
+                                    else -> "保存: $name → $actual"
+                                }
                             } catch (e: UnsupportedFileException) {
                                 skipped += "スキップ: $name(${e.message})"
                             }

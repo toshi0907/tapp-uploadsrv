@@ -27,8 +27,8 @@ class UnsupportedFileException(message: String) : IOException(message)
  * アップロードされたファイルの保存先。同名ファイルがあれば上書きせず、`name (1).ext` のような別名で保存する。
  */
 interface UploadStorage {
-    /** [name] を元にした名前で保存し、実際に保存した名前を返す。 */
-    suspend fun save(name: String, write: suspend (OutputStream) -> Unit): String
+    /** [name] を元にした名前で保存し、実際に保存した名前を返す。保存はできたが名前を確認できなければ null。 */
+    suspend fun save(name: String, write: suspend (OutputStream) -> Unit): String?
 
     companion object {
         /**
@@ -75,19 +75,41 @@ interface UploadStorage {
             // 先頭のドットだけの名前(.hidden 等)は拡張子とみなさない
             val (base, ext) = if (dot > 0) name.substring(0, dot) to name.substring(dot) else name to ""
             for (i in 1..MAX_SUFFIX) {
-                val candidate = "$base ($i)$ext"
+                val suffix = " ($i)$ext"
+                // 番号を付けてもファイル名の上限(UTF-8で255バイト)に収まるよう、元の名前の側を短くする
+                val candidate = truncateUtf8(base, MAX_NAME_BYTES - utf8Length(suffix)) + suffix
                 if (candidate.lowercase() !in lower) return candidate
             }
             throw IOException("別名を決められません: $name")
         }
 
+        /** [text] を UTF-8 で [maxBytes] バイト以内に切り詰める。文字(サロゲートペア含む)の途中では切らない。 */
+        private fun truncateUtf8(text: String, maxBytes: Int): String {
+            if (maxBytes <= 0) return ""
+            var bytes = 0
+            var end = 0
+            while (end < text.length) {
+                val codePoint = text.codePointAt(end)
+                val size = utf8Length(String(Character.toChars(codePoint)))
+                if (bytes + size > maxBytes) break
+                bytes += size
+                end += Character.charCount(codePoint)
+            }
+            return text.substring(0, end)
+        }
+
+        private fun utf8Length(text: String): Int = text.toByteArray(Charsets.UTF_8).size
+
         private const val MAX_SUFFIX = 9999
+
+        /** 一般的なファイルシステムのファイル名の上限(バイト)。 */
+        private const val MAX_NAME_BYTES = 255
     }
 }
 
 /** SAFで選んだフォルダ([treeUri])に保存する。 */
 private class FolderStorage(private val context: Context, private val treeUri: Uri) : UploadStorage {
-    override suspend fun save(name: String, write: suspend (OutputStream) -> Unit): String {
+    override suspend fun save(name: String, write: suspend (OutputStream) -> Unit): String? {
         val resolver = context.contentResolver
         val parent = DocumentsContract.buildDocumentUriUsingTree(treeUri, DocumentsContract.getTreeDocumentId(treeUri))
         val file = UploadStorage.nameLock.withLock {
@@ -110,7 +132,6 @@ private class FolderStorage(private val context: Context, private val treeUri: U
             throw e
         }
         return withContext(Dispatchers.IO) { displayName(resolver, file, DocumentsContract.Document.COLUMN_DISPLAY_NAME) }
-            ?: name
     }
 
     /** フォルダ直下の名前の一覧(ファイル・フォルダとも)。1回の問い合わせで取得する。 */
@@ -138,7 +159,7 @@ private class FolderStorage(private val context: Context, private val treeUri: U
 private class GalleryStorage(private val context: Context, album: String) : UploadStorage {
     private val relativePath = "${Environment.DIRECTORY_PICTURES}/$album/"
 
-    override suspend fun save(name: String, write: suspend (OutputStream) -> Unit): String {
+    override suspend fun save(name: String, write: suspend (OutputStream) -> Unit): String? {
         val mime = mimeTypeOf(name)
         val collection = when {
             mime == null -> null
@@ -178,7 +199,6 @@ private class GalleryStorage(private val context: Context, album: String) : Uplo
             throw e
         }
         return withContext(Dispatchers.IO) { displayName(resolver, item, MediaStore.MediaColumns.DISPLAY_NAME) }
-            ?: name
     }
 
     /** このアルバム内で(このアプリから見える)既存のファイル名。書き込み中・ゴミ箱の項目も含める。 */
@@ -229,9 +249,12 @@ private suspend fun writeTo(
     name: String,
     write: suspend (OutputStream) -> Unit,
 ) {
-    val output = withContext(Dispatchers.IO) { resolverCall { resolver.openOutputStream(uri, "w") } }
-        ?: throw IOException("書き込みを開始できません: $name")
-    withContext(Dispatchers.IO) { output.buffered().use { write(it) } }
+    // 開いてから閉じるまでを同じ withContext で行い、間でキャンセルされてもストリームを閉じ漏らさない
+    withContext(Dispatchers.IO) {
+        val output = resolverCall { resolver.openOutputStream(uri, "w") }
+            ?: throw IOException("書き込みを開始できません: $name")
+        output.buffered().use { write(it) }
+    }
 }
 
 /**
