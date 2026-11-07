@@ -137,7 +137,7 @@ class FrontServer(
         val read = try {
             client.getInputStream().read(buffer)
         } catch (e: SocketTimeoutException) {
-            AccessLog.add(name, "${FIRST_DATA_TIMEOUT_MS / 1000}秒間データが届かないため切断しました(先行接続の可能性)")
+            AccessLog.add(name, "${FIRST_DATA_TIMEOUT_MS / 60_000}分間データが届かないため切断しました(先行接続の可能性)")
             closeQuietly(client)
             return
         } catch (e: IOException) {
@@ -202,7 +202,7 @@ class FrontServer(
         val read = try {
             socket.inputStream.read(buffer)
         } catch (e: SocketTimeoutException) {
-            AccessLog.add(name, "HTTPS: ${FIRST_DATA_TIMEOUT_MS / 1000}秒間リクエストが届かないため切断しました(先行接続の可能性)")
+            AccessLog.add(name, "HTTPS: ${FIRST_DATA_TIMEOUT_MS / 60_000}分間リクエストが届かないため切断しました(先行接続の可能性)")
             closeQuietly(socket)
             return
         } catch (e: IOException) {
@@ -375,7 +375,11 @@ class FrontServer(
     companion object {
         private const val BUFFER_SIZE = 64 * 1024
         private const val TLS_HANDSHAKE = 0x16
-        private const val FIRST_DATA_TIMEOUT_MS = 60_000
+        /**
+         * 接続から最初のデータが届くまでの待ち時間。ブラウザは接続を先に開いておき、大きいファイルの
+         * 送信準備が終わってから送り始めることがあるため、短くすると送信前に切断してしまう。
+         */
+        private const val FIRST_DATA_TIMEOUT_MS = 5 * 60_000
         private const val CONNECT_TIMEOUT_MS = 5_000
         private const val MAX_LOG_LINE = 200
         private const val MAX_LINE_SCAN = 8 * 1024

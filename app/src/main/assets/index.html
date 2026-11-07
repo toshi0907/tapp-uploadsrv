@@ -21,6 +21,7 @@
   .status { font-size: 0.9rem; color: #555; }
   .status.ok { color: #2e7d32; }
   .status.ng { color: #c62828; }
+  #retry[hidden] { display: none; }
   progress { display: block; width: 100%; height: 8px; margin-top: 4px; }
 </style>
 </head>
@@ -34,6 +35,7 @@
     <button id="send" disabled>アップロード</button>
   </div>
   <p id="summary"></p>
+  <button id="retry" hidden>失敗したファイルを再送</button>
   <ul id="results"></ul>
 </main>
 <script>
@@ -59,6 +61,24 @@
   drop.addEventListener('drop', e => setFiles(e.dataTransfer.files));
 
   const summary = document.getElementById('summary');
+
+  const retry = document.getElementById('retry');
+
+  // 失敗したファイル(「失敗したファイルを再送」で送り直す)
+  let failedItems = [];
+
+  // 通信エラー時に自動で再送するまでの待ち時間(ミリ秒)。要素数が再送の回数
+  const RETRY_DELAYS = [2000, 5000, 10000];
+
+  // ファイルごとの送信ID。再送しても同じ値を送り、サーバー側で二重に保存されないようにする
+  // (HTTP では crypto.randomUUID が使えないため Math.random で作る)
+  let idSeq = 0;
+  function newUploadId() {
+    return Date.now().toString(36) + '-' + (idSeq++).toString(36) + '-' +
+      Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 10);
+  }
+
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
 
   // 送信待ちを含む一連のアップロード全体の集計(キューが空になったら次回リセット)
   const queue = [];
@@ -104,10 +124,11 @@
   }
 
   // fetch では送信の進捗を取れないため XMLHttpRequest で送る
-  function sendFile(file, onProgress, onSent) {
+  function sendFile(file, id, onProgress, onSent) {
     return new Promise(resolve => {
       const xhr = new XMLHttpRequest();
       xhr.open('POST', '/upload');
+      xhr.setRequestHeader('X-Upload-Id', id);
       xhr.upload.onprogress = e => onProgress(e.lengthComputable ? e.loaded / e.total : null);
       xhr.upload.onload = onSent;
       xhr.onload = () => resolve({ status: xhr.status, text: xhr.responseText });
@@ -119,11 +140,37 @@
   }
 
   // 結果({ ok, sent })を返す。sent は集計に加える送信量(通信エラー時は途中までの量)
-  async function upload(file, item) {
-    const started = performance.now();
+  async function upload(file, item, id) {
+    let res = null;
     let sentBytes = 0;
+    for (let attempt = 0; ; attempt++) {
+      sentBytes = 0;
+      res = await sendOnce(file, item, id, sent => { sentBytes = sent; });
+      if (res !== null || attempt >= RETRY_DELAYS.length) break;
+      // 通信エラーは一時的なことが多いので、少し待ってから自動で再送する
+      total.currentBytes = 0;
+      updateSummary();
+      item.bar.value = 0;
+      const wait = RETRY_DELAYS[attempt];
+      item.status.textContent = `通信エラー。${wait / 1000}秒後に再送します(${attempt + 1}/${RETRY_DELAYS.length})`;
+      await sleep(wait);
+    }
+    if (res === null) {
+      finishItem(item, '失敗(通信エラー)', false);
+      return { ok: false, sent: sentBytes };
+    }
+    const ok = res.status >= 200 && res.status < 300;
+    // 成功時・スキップ時(415)はサーバーの結果(実際に保存した名前など)をそのまま表示する
+    const skipped = res.status === 415;
+    finishItem(item, ok || skipped ? res.text : `失敗(${res.text})`, ok);
+    return { ok: ok || skipped, sent: file.size };
+  }
+
+  // 1回分の送信。通信エラーなら null
+  function sendOnce(file, item, id, onSentBytes) {
+    const started = performance.now();
     item.status.textContent = '送信中 0%';
-    const res = await sendFile(file, ratio => {
+    return sendFile(file, id, ratio => {
       if (ratio === null) {
         item.bar.removeAttribute('value');
         item.status.textContent = '送信中';
@@ -131,7 +178,7 @@
       }
       // 進捗はマルチパートの区切りを含む全体に対する割合なので、ファイルサイズに換算して表示する
       const sent = Math.round(file.size * ratio);
-      sentBytes = sent;
+      onSentBytes(sent);
       const seconds = (performance.now() - started) / 1000;
       const speed = seconds > 0 ? ` · ${formatBytes(Math.round(sent / seconds))}/s` : '';
       item.bar.value = ratio;
@@ -144,46 +191,75 @@
       item.bar.removeAttribute('value');
       item.status.textContent = '保存処理中…';
     });
-    if (res === null) {
-      finishItem(item, '失敗(通信エラー)', false);
-      return { ok: false, sent: sentBytes };
-    }
-    const ok = res.status >= 200 && res.status < 300;
-    // 成功時・スキップ時(415)はサーバーの結果(実際に保存した名前など)をそのまま表示する
-    const skipped = res.status === 415;
-    finishItem(item, ok || skipped ? res.text : `失敗(${res.text})`, ok);
-    return { ok: ok || skipped, sent: file.size };
   }
 
   // 1ファイルずつ順に送信する(1リクエストあたりのサイズを抑える)
   async function runQueue() {
     running = true;
+    retry.hidden = true;
     while (queue.length) {
-      const { file, item } = queue.shift();
+      const entry = queue.shift();
       updateSummary();
-      const result = await upload(file, item);
-      if (!result.ok) total.failed++;
+      const result = await upload(entry.file, entry.item, entry.id);
+      if (!result.ok) {
+        total.failed++;
+        failedItems.push(entry);
+      }
       total.done++;
       total.doneBytes += result.sent;
       total.currentBytes = 0;
     }
     running = false;
     updateSummary();
+    retry.hidden = failedItems.length === 0;
+    retry.textContent = `失敗したファイルを再送(${failedItems.length}件)`;
   }
+
+  function resetTotal() {
+    total = { files: 0, bytes: 0, done: 0, failed: 0, doneBytes: 0, currentBytes: 0 };
+  }
+
+  function enqueue(entry) {
+    queue.push(entry);
+    total.files++;
+    total.bytes += entry.file.size;
+  }
+
+  // 失敗したファイルを、同じ表示行・同じ送信IDのまま送り直す
+  retry.addEventListener('click', () => {
+    if (running || failedItems.length === 0) return;
+    const entries = failedItems;
+    failedItems = [];
+    resetTotal();
+    for (const entry of entries) {
+      const { item } = entry;
+      item.bar = document.createElement('progress');
+      item.bar.max = 1;
+      item.bar.value = 0;
+      item.li.append(item.bar);
+      item.status.className = 'status';
+      item.status.textContent = `待機中(${formatBytes(entry.file.size)})`;
+      enqueue(entry);
+    }
+    runQueue();
+  });
 
   send.addEventListener('click', () => {
     const files = pending;
     setFiles([]);
     input.value = '';
-    if (!running) total = { files: 0, bytes: 0, done: 0, failed: 0, doneBytes: 0, currentBytes: 0 };
+    if (!running) {
+      resetTotal();
+      // 新しく送り始めたら、前回の失敗分の再送は表示しない
+      failedItems = [];
+      retry.hidden = true;
+    }
     // 選んだ順に上から並べる(新しい選択ほど上に表示する)
     const fragment = document.createDocumentFragment();
     for (const file of files) {
       const item = createItem(file);
       fragment.append(item.li);
-      queue.push({ file, item });
-      total.files++;
-      total.bytes += file.size;
+      enqueue({ file, item, id: newUploadId() });
     }
     results.prepend(fragment);
     if (running) updateSummary(); else runQueue();

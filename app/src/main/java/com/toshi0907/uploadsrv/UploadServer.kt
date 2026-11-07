@@ -2,6 +2,7 @@ package com.toshi0907.uploadsrv
 
 import android.content.Context
 import io.ktor.http.ContentType
+import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.content.PartData
 import io.ktor.http.content.forEachPart
@@ -10,11 +11,13 @@ import io.ktor.server.application.ApplicationCall
 import io.ktor.server.cio.CIO
 import io.ktor.server.engine.EmbeddedServer
 import io.ktor.server.engine.embeddedServer
+import io.ktor.server.request.receiveChannel
 import io.ktor.server.request.receiveMultipart
 import io.ktor.server.response.respondText
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.routing
+import io.ktor.utils.io.discard
 import io.ktor.utils.io.jvm.javaio.copyTo
 import java.io.File
 import java.io.IOException
@@ -33,6 +36,7 @@ class UploadServer(context: Context, private val port: Int) {
     private val indexHtml: String by lazy {
         appContext.assets.open("index.html").bufferedReader(Charsets.UTF_8).use { it.readText() }
     }
+    private val replies = UploadReplies()
     private var server: EmbeddedServer<*, *>? = null
     private var front: FrontServer? = null
 
@@ -56,6 +60,9 @@ class UploadServer(context: Context, private val port: Int) {
                     call.respondText(indexHtml, ContentType.Text.Html.withCharset(Charsets.UTF_8))
                 }
                 post("/upload") {
+                    // 1ファイルごとに接続を閉じる。使い回した接続がサーバー側で既に閉じていて
+                    // 次のファイルの送信が失敗する(ブラウザは POST を自動で再送しない)のを防ぐ
+                    call.response.headers.append(HttpHeaders.Connection, "close")
                     handleUpload(call)
                 }
             }
@@ -74,12 +81,22 @@ class UploadServer(context: Context, private val port: Int) {
     }
 
     private suspend fun handleUpload(call: ApplicationCall) {
+        // 通信エラーでブラウザが再送してきた場合に二重に保存しないよう、送信IDごとに結果を覚えておく
+        val id = call.request.headers[UPLOAD_ID_HEADER]?.takeIf(UploadReplies::isValidId)
+        val reply = if (id == null) {
+            receiveUpload(call)
+        } else {
+            replies.run(id, discardBody = { call.receiveChannel().discard() }) { receiveUpload(call) }
+        }
+        call.respondText(reply.text, status = reply.status)
+    }
+
+    private suspend fun receiveUpload(call: ApplicationCall): UploadReply {
         // 保存方式は設定の変更を次のアップロードから反映するため、リクエストごとに決める
         val storage = try {
             UploadStorage.from(appContext, settings)
         } catch (e: IOException) {
-            call.respondText(e.message ?: "保存先を準備できません", status = HttpStatusCode.ServiceUnavailable)
-            return
+            return UploadReply(HttpStatusCode.ServiceUnavailable, e.message ?: "保存先を準備できません")
         }
         val saved = mutableListOf<String>()
         val skipped = mutableListOf<String>()
@@ -109,22 +126,24 @@ class UploadServer(context: Context, private val port: Int) {
             }
         } catch (e: IOException) {
             val done = (saved + skipped).joinToString("\n")
-            call.respondText(
+            return UploadReply(
+                HttpStatusCode.InternalServerError,
                 "保存に失敗しました: ${e.message}" + if (done.isEmpty()) "" else "\n$done",
-                status = HttpStatusCode.InternalServerError,
             )
-            return
         }
         val lines = (saved + skipped).joinToString("\n")
-        when {
-            saved.isNotEmpty() -> call.respondText(lines)
-            skipped.isNotEmpty() -> call.respondText(lines, status = HttpStatusCode.UnsupportedMediaType)
-            else -> call.respondText("ファイルがありません", status = HttpStatusCode.BadRequest)
+        return when {
+            saved.isNotEmpty() -> UploadReply(HttpStatusCode.OK, lines)
+            skipped.isNotEmpty() -> UploadReply(HttpStatusCode.UnsupportedMediaType, lines)
+            else -> UploadReply(HttpStatusCode.BadRequest, "ファイルがありません")
         }
     }
 
     companion object {
         private const val LOOPBACK = "127.0.0.1"
+
+        /** ブラウザがファイルごとに付ける送信ID(再送時も同じ値)。 */
+        private const val UPLOAD_ID_HEADER = "X-Upload-Id"
 
         /** パス区切りや制御文字を除いたファイル名を返す。使えない名前なら null。 */
         fun sanitizeFileName(original: String?): String? {
