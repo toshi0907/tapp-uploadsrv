@@ -11,10 +11,10 @@ Android端末上でHTTPサーバーを常駐させ、同一Wi-Fi内のブラウ�
 
 ## 構成(`app/src/main/java/com/toshi0907/uploadsrv/`)
 
-- `UploadServer`: Ktor(CIO)。`GET /` で `assets/index.html`、`POST /upload` でmultipartを保存先へストリーミング書き込み
+- `UploadServer`: Ktor(CIO)。`GET /` で `assets/index.html`、`POST /upload` でmultipartを `UploadStorage` 経由でストリーミング書き込み
 - `FrontServer`: 公開ポートで受け、先頭バイトでHTTP/TLSを判別してループバックのKtorへ中継(CIOはTLS非対応)。経過は `AccessLog` に記録。証明書は `TlsIdentity` が自己署名で生成
 - `MainActivity`(Compose UI)→ `UploadService`(フォアグラウンドサービス)→ `ServerController`(起動/停止をMutexで直列化、状態をStateFlowで公開)→ `UploadServer`
-- `AppSettings`: SharedPreferences。保存先はSAFのツリーURI(`DocumentFile` 経由で書き込む)
+- `AppSettings`: SharedPreferences。保存方式は任意フォルダ(SAFのツリーURI)かギャラリー(MediaStoreで `Pictures/<アルバム名>`、Android 10以上)
 - `UpdateManager` / `UpdateCheckWorker`: GitHub Releases `latest` を確認してAPKを更新(WorkManagerで定期実行)
 - 依存バージョンは `gradle/libs.versions.toml` で管理する
 
@@ -26,4 +26,4 @@ Android端末上でHTTPサーバーを常駐させ、同一Wi-Fi内のブラウ�
 
 ## 設計上の決定
 
-- FGS種別は `specialUse`、同名ファイルは上書き、サブフォルダ振り分けなし、画面は日本語のみ、ポートは設定可能(初期値8080、1024〜65535)
+- FGS種別は `specialUse`、同名ファイルは `名前 (1).拡張子` の別名で保存(上書きしない)、ギャラリー方式は写真・動画のみ、サブフォルダ振り分けなし、画面は日本語のみ、ポートは設定可能(初期値8080、1024〜65535)

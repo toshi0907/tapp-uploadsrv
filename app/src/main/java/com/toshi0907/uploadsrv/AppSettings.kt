@@ -3,6 +3,7 @@ package com.toshi0907.uploadsrv
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import androidx.core.content.edit
 import androidx.documentfile.provider.DocumentFile
 
@@ -17,6 +18,26 @@ class AppSettings(context: Context) {
     var saveFolderUri: Uri?
         get() = prefs.getString(KEY_SAVE_FOLDER_URI, null)?.let(Uri::parse)
         private set(value) = prefs.edit { putString(KEY_SAVE_FOLDER_URI, value?.toString()) }
+
+    /**
+     * 保存方式。ギャラリー方式は Android 10 未満では使えないため、その場合は常に任意フォルダ方式になる。
+     */
+    var saveMode: SaveMode
+        get() {
+            val stored = prefs.getString(KEY_SAVE_MODE, null)
+                ?.let { name -> SaveMode.entries.firstOrNull { it.name == name } }
+                ?: SaveMode.FOLDER
+            return if (stored == SaveMode.GALLERY && !isGallerySupported()) SaveMode.FOLDER else stored
+        }
+        set(value) = prefs.edit { putString(KEY_SAVE_MODE, value.name) }
+
+    /** ギャラリー方式で保存するアルバム名(`Pictures/<アルバム名>`)。 */
+    var albumName: String
+        get() = prefs.getString(KEY_ALBUM_NAME, null) ?: DEFAULT_ALBUM_NAME
+        set(value) {
+            require(isValidAlbumName(value)) { "invalid album name: $value" }
+            prefs.edit { putString(KEY_ALBUM_NAME, value) }
+        }
 
     /** HTTPサーバーの待ち受けポート。 */
     var port: Int
@@ -54,6 +75,12 @@ class AppSettings(context: Context) {
         }
     }
 
+    /** 現在の保存方式で保存できる状態か(サーバーを起動できるか)。 */
+    fun hasValidDestination(): Boolean = when (saveMode) {
+        SaveMode.GALLERY -> isValidAlbumName(albumName)
+        SaveMode.FOLDER -> hasValidSaveFolder()
+    }
+
     /** 保存先フォルダの書き込み権限が現在も有効か。 */
     fun hasValidSaveFolder(): Boolean {
         val uri = saveFolderUri ?: return false
@@ -69,13 +96,44 @@ class AppSettings(context: Context) {
 
     companion object {
         const val DEFAULT_PORT = 8080
+        const val DEFAULT_ALBUM_NAME = "アップロード"
+        /** アルバム名の最大文字数。フォルダ名の上限(UTF-8で255バイト)に収まるよう、全角でも余裕を持たせる。 */
+        const val MAX_ALBUM_NAME_LENGTH = 50
         private const val PREFS_NAME = "settings"
         private const val KEY_SAVE_FOLDER_URI = "save_folder_uri"
         private const val KEY_PORT = "port"
+        private const val KEY_SAVE_MODE = "save_mode"
+        private const val KEY_ALBUM_NAME = "album_name"
         private const val KEY_SERVER_ENABLED = "server_enabled"
         private const val KEY_LAST_NOTIFIED_UPDATE_BUILD = "last_notified_update_build"
 
         /** 一般アプリが待ち受けできる範囲(1024〜65535)か。 */
         fun isValidPort(port: Int): Boolean = port in 1024..65535
+
+        /** ギャラリー方式(MediaStore の RELATIVE_PATH を使う)を使えるか。Android 10 以降のみ。 */
+        fun isGallerySupported(): Boolean = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+
+        /** アルバム名(フォルダ名)として使えない文字。パス区切りのほか、FAT系で使えない記号も除く。 */
+        private const val INVALID_ALBUM_CHARS = "/\\:*?\"<>|"
+
+        /**
+         * アルバム名として使えるか。空・前後の空白・`.` で始まる名前(隠しフォルダ扱い)・
+         * パス区切り等の記号・制御文字・長すぎる名前は不可。
+         */
+        fun isValidAlbumName(name: String): Boolean =
+            name.isNotEmpty() &&
+                name.length <= MAX_ALBUM_NAME_LENGTH &&
+                name == name.trim() &&
+                !name.startsWith('.') &&
+                name.none { it.isISOControl() || it in INVALID_ALBUM_CHARS }
     }
+}
+
+/** アップロードの保存方式。 */
+enum class SaveMode {
+    /** SAFで選んだ任意のフォルダに保存する。 */
+    FOLDER,
+
+    /** MediaStore 経由で `Pictures/<アルバム名>` に保存し、ギャラリーのアルバムとして表示させる。 */
+    GALLERY,
 }

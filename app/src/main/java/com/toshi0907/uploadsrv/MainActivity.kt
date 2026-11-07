@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
@@ -33,6 +34,7 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -46,6 +48,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
@@ -104,6 +107,9 @@ private fun MainScreen(modifier: Modifier = Modifier) {
     val context = LocalContext.current
     val settings = remember { AppSettings(context) }
     var folder by remember { mutableStateOf(settings.folderState()) }
+    var saveMode by remember { mutableStateOf(settings.saveMode) }
+    var savedAlbum by remember { mutableStateOf(settings.albumName) }
+    var albumText by remember { mutableStateOf(savedAlbum) }
 
     // 設定アプリ等で権限が外された場合に備え、画面復帰のたびに再確認する
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
@@ -119,6 +125,12 @@ private fun MainScreen(modifier: Modifier = Modifier) {
                 Toast.makeText(context, "フォルダの権限を取得できませんでした", Toast.LENGTH_LONG).show()
             }
         folder = settings.folderState()
+    }
+
+    val albumTextValid = AppSettings.isValidAlbumName(albumText)
+    val destinationValid = when (saveMode) {
+        SaveMode.GALLERY -> AppSettings.isValidAlbumName(savedAlbum)
+        SaveMode.FOLDER -> folder.valid
     }
 
     Column(
@@ -137,33 +149,120 @@ private fun MainScreen(modifier: Modifier = Modifier) {
                 modifier = Modifier.padding(16.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                Text(text = "保存先フォルダ", style = MaterialTheme.typography.titleMedium)
-                val description = when {
-                    !folder.selected -> "未選択"
-                    !folder.valid -> "${folder.name ?: "(不明)"}(アクセス権限がありません。選び直してください)"
-                    else -> folder.name ?: "(名前を取得できません)"
-                }
+                Text(text = "保存先", style = MaterialTheme.typography.titleMedium)
                 Text(
-                    text = description,
-                    color = if (folder.valid) {
-                        MaterialTheme.colorScheme.onSurface
-                    } else {
-                        MaterialTheme.colorScheme.error
+                    text = "同じ名前のファイルがある場合は「名前 (1).jpg」のような別名で保存します。" +
+                        "変更は次のアップロードから反映されます",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+
+                val gallerySupported = AppSettings.isGallerySupported()
+                SaveModeOption(
+                    label = "ギャラリー(アルバム)",
+                    selected = saveMode == SaveMode.GALLERY,
+                    enabled = gallerySupported,
+                    onSelect = {
+                        settings.saveMode = SaveMode.GALLERY
+                        saveMode = settings.saveMode
                     },
                 )
-                Button(onClick = { pickFolder.launch(null) }) {
-                    Text(text = if (folder.valid) "フォルダを変更" else "フォルダを選択")
+                if (!gallerySupported) {
+                    Text(
+                        text = "ギャラリーへの保存は Android 10 以上で利用できます",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                if (saveMode == SaveMode.GALLERY) {
+                    Text(text = "現在のアルバム: Pictures/$savedAlbum")
+                    OutlinedTextField(
+                        value = albumText,
+                        onValueChange = { text -> albumText = text },
+                        label = { Text("アルバム名") },
+                        singleLine = true,
+                        isError = !albumTextValid,
+                        supportingText = {
+                            Text(
+                                if (albumTextValid) {
+                                    "ギャラリーにアルバムとして表示されます。写真・動画以外のファイルは保存しません"
+                                } else {
+                                    "1〜${AppSettings.MAX_ALBUM_NAME_LENGTH}文字で入力してください" +
+                                        "(前後の空白、先頭の「.」、記号 / \\ : * ? \" < > | は使えません)"
+                                },
+                            )
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    // 入力途中の名前でアルバムが作られないよう、確定ボタンで反映する
+                    Button(
+                        onClick = {
+                            settings.albumName = albumText
+                            savedAlbum = settings.albumName
+                        },
+                        enabled = albumTextValid && albumText != savedAlbum,
+                    ) {
+                        Text(text = "アルバム名を変更")
+                    }
+                }
+
+                SaveModeOption(
+                    label = "任意のフォルダ",
+                    selected = saveMode == SaveMode.FOLDER,
+                    enabled = true,
+                    onSelect = {
+                        settings.saveMode = SaveMode.FOLDER
+                        saveMode = settings.saveMode
+                    },
+                )
+                if (saveMode == SaveMode.FOLDER) {
+                    val description = when {
+                        !folder.selected -> "未選択"
+                        !folder.valid -> "${folder.name ?: "(不明)"}(アクセス権限がありません。選び直してください)"
+                        else -> folder.name ?: "(名前を取得できません)"
+                    }
+                    Text(
+                        text = description,
+                        color = if (folder.valid) {
+                            MaterialTheme.colorScheme.onSurface
+                        } else {
+                            MaterialTheme.colorScheme.error
+                        },
+                    )
+                    Button(onClick = { pickFolder.launch(null) }) {
+                        Text(text = if (folder.valid) "フォルダを変更" else "フォルダを選択")
+                    }
                 }
             }
         }
 
-        ServerCard(settings = settings, folderValid = folder.valid)
+        ServerCard(settings = settings, destinationValid = destinationValid)
 
         AccessLogCard()
 
         BatteryOptimizationCard()
 
         UpdateCard()
+    }
+}
+
+/** 保存方式の選択肢(ラジオボタン+ラベル)。行全体をタップで選べる。 */
+@Composable
+private fun SaveModeOption(label: String, selected: Boolean, enabled: Boolean, onSelect: () -> Unit) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .selectable(selected = selected, enabled = enabled, role = Role.RadioButton, onClick = onSelect),
+    ) {
+        RadioButton(selected = selected, onClick = null, enabled = enabled)
+        Text(
+            text = label,
+            modifier = Modifier.padding(start = 8.dp),
+            color = if (enabled) {
+                MaterialTheme.colorScheme.onSurface
+            } else {
+                MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+            },
+        )
     }
 }
 
@@ -243,7 +342,7 @@ private fun UpdateCard() {
 }
 
 @Composable
-private fun ServerCard(settings: AppSettings, folderValid: Boolean) {
+private fun ServerCard(settings: AppSettings, destinationValid: Boolean) {
     val context = LocalContext.current
     val requestNotification = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
@@ -266,7 +365,7 @@ private fun ServerCard(settings: AppSettings, folderValid: Boolean) {
                 )
                 Switch(
                     checked = running,
-                    enabled = running || (folderValid && portValue != null),
+                    enabled = running || (destinationValid && portValue != null),
                     onCheckedChange = { on ->
                         if (on && portValue != null) {
                             settings.port = portValue
@@ -349,7 +448,7 @@ private fun ServerCard(settings: AppSettings, folderValid: Boolean) {
                 }
                 is ServerState.Failed -> Text(text = s.message, color = MaterialTheme.colorScheme.error)
                 ServerState.Stopped -> Text(
-                    text = if (folderValid) "停止中" else "保存先フォルダを選択すると起動できます",
+                    text = if (destinationValid) "停止中" else "保存先を設定すると起動できます",
                 )
             }
         }
